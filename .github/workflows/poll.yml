@@ -1,0 +1,44 @@
+name: JI podcast summarizer
+
+on:
+  # Ping via cron-job.org (workflow_dispatch API) for ~2-min cadence.
+  workflow_dispatch:
+  # Best-effort fallback if the pinger stops.
+  schedule:
+    - cron: "*/10 * * * *"
+
+# poll.py commits watcher_state.json back to the repo.
+permissions:
+  contents: write
+
+concurrency:
+  group: poll
+  cancel-in-progress: false
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install deps
+        run: pip install -r requirements.txt
+      - name: Poll and summarize
+        run: python3 poll.py
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      - name: Commit updated state
+        run: |
+          git config user.name "podcast-summarizer-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add watcher_state.json
+          if git diff --cached --quiet; then
+            echo "no state changes"
+          else
+            git commit -m "Update watcher state"
+            git push
+          fi
