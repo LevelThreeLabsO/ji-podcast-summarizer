@@ -121,7 +121,7 @@ class Slack:
 # ── YouTube ────────────────────────────────────────────────────────────────────
 
 def yt_title(video_id):
-    """No-auth title fetch via oEmbed."""
+    """No-auth title fetch via oEmbed. Falls back to yt-dlp if oembed fails."""
     try:
         r = requests.get(
             "https://www.youtube.com/oembed",
@@ -132,59 +132,112 @@ def yt_title(video_id):
             return r.json().get("title", "video")
     except Exception:
         pass
-    return "video"
+    return yt_title_via_ytdlp(video_id)
 
 
-def _build_yt_session():
-    """If YT_COOKIES_B64 is set, load those cookies into a requests.Session so
-    YouTube treats us as an authenticated user. Otherwise return None (default).
-
-    YouTube blocks unauthenticated cloud IPs aggressively; the same code that
-    works from a residential IP (e.g. ClipMaker on the user's Mac) gets a
-    RequestBlocked error from GitHub Actions. Cookies solve that.
-    """
+def _write_cookies_file():
+    """If YT_COOKIES_B64 is set, decode it to a temp cookies.txt and return the
+    path. Otherwise return None. Used to make yt-dlp requests look like a signed-in
+    YouTube user — needed when residential IPs are blocked. Optional; without it
+    yt-dlp tries anonymously and often succeeds anyway."""
     import base64
     import tempfile
-    from http.cookiejar import MozillaCookieJar
 
     b64 = os.environ.get("YT_COOKIES_B64")
     if not b64:
         return None
     try:
         raw = base64.b64decode(b64).decode("utf-8", errors="replace")
-        # MozillaCookieJar wants a file path
-        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
-            f.write(raw)
-            path = f.name
-        jar = MozillaCookieJar(path)
-        jar.load(ignore_discard=True, ignore_expires=True)
-        session = requests.Session()
-        session.cookies = jar
-        return session
+        f = tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False)
+        f.write(raw)
+        f.close()
+        return f.name
     except Exception as e:
-        print(f"  ! couldn't load YT_COOKIES_B64: {type(e).__name__}: {e}",
+        print(f"  ! couldn't decode YT_COOKIES_B64: {type(e).__name__}: {e}",
               file=sys.stderr)
         return None
 
 
+def _parse_json3_subs(path):
+    """Parse yt-dlp's json3 subtitle format into [{text, start, duration}]."""
+    with open(path) as f:
+        data = json.load(f)
+    out = []
+    for event in data.get("events", []):
+        start = (event.get("tStartMs", 0) or 0) / 1000.0
+        duration = (event.get("dDurationMs", 0) or 0) / 1000.0
+        parts = []
+        for seg in event.get("segs", []) or []:
+            if "utf8" in seg:
+                parts.append(seg["utf8"])
+        text = "".join(parts).replace("\n", " ").strip()
+        if text:
+            out.append({"text": text, "start": start, "duration": duration})
+    return out
+
+
 def yt_transcript(video_id):
-    """Fetch YouTube transcript. Returns list of {text, start, duration} or None."""
-    try:
-        from youtube_transcript_api import YouTubeTranscriptApi
-        session = _build_yt_session()
-        api = YouTubeTranscriptApi(http_client=session) if session else YouTubeTranscriptApi()
+    """Fetch YouTube transcript via yt-dlp. Returns [{text, start, duration}] or None.
+
+    Same tool ClipMaker uses on the user's Mac. Much more resilient to blocking
+    than youtube-transcript-api's raw HTTP calls. If YT_COOKIES_B64 is set, uses
+    those cookies to authenticate.
+    """
+    import glob
+    import tempfile
+    import yt_dlp
+
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    cookies_path = _write_cookies_file()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        outtmpl = os.path.join(tmpdir, "%(id)s")
+        opts = {
+            "skip_download": True,
+            "writeautomaticsub": True,   # auto-generated captions
+            "writesubtitles": True,       # human captions (preferred)
+            "subtitleslangs": ["en", "en-orig", "en-US", "en-GB"],
+            "subtitlesformat": "json3",   # structured with timings
+            "outtmpl": outtmpl,
+            "quiet": True,
+            "no_warnings": True,
+            "ignoreerrors": False,
+        }
+        if cookies_path:
+            opts["cookiefile"] = cookies_path
+
         try:
-            fetched = api.fetch(video_id, languages=["en", "en-US", "en-GB"])
-        except Exception:
-            # No English track — try whatever is available.
-            transcripts = api.list(video_id)
-            fetched = next(iter(transcripts)).fetch()
-        # FetchedTranscript is iterable of FetchedTranscriptSnippet(text, start, duration)
-        return [{"text": s.text, "start": s.start, "duration": s.duration}
-                for s in fetched]
-    except Exception as e:
-        print(f"  ! transcript fetch failed: {type(e).__name__}: {e}", file=sys.stderr)
-        return None
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.download([url])
+        except Exception as e:
+            print(f"  ! yt-dlp download failed: {type(e).__name__}: {e}", file=sys.stderr)
+            return None
+
+        candidates = glob.glob(os.path.join(tmpdir, f"{video_id}.*.json3"))
+        if not candidates:
+            print(f"  ! yt-dlp produced no subtitle file for {video_id}", file=sys.stderr)
+            return None
+        try:
+            return _parse_json3_subs(candidates[0])
+        except Exception as e:
+            print(f"  ! subtitle parse failed: {type(e).__name__}: {e}", file=sys.stderr)
+            return None
+
+
+def yt_title_via_ytdlp(video_id):
+    """Fallback title fetch via yt-dlp (uses cookies if available)."""
+    import yt_dlp
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    cookies_path = _write_cookies_file()
+    opts = {"skip_download": True, "quiet": True, "no_warnings": True}
+    if cookies_path:
+        opts["cookiefile"] = cookies_path
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+        return (info or {}).get("title") or "video"
+    except Exception:
+        return "video"
 
 
 # ── Twitter/X ──────────────────────────────────────────────────────────────────
