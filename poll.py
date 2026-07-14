@@ -219,8 +219,11 @@ def yt_transcript(video_id):
 
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         if proc.returncode != 0:
-            print(f"  ! yt-dlp failed: {proc.stderr.strip().splitlines()[-1] if proc.stderr else 'unknown'}",
-                  file=sys.stderr)
+            # Print full stderr — warnings above the ERROR line are the useful ones
+            # (challenge solver info, PO-token hints, impersonation warnings, etc.)
+            print("  ! yt-dlp failed. Full stderr:", file=sys.stderr)
+            for line in (proc.stderr or "").strip().splitlines():
+                print(f"    {line}", file=sys.stderr)
             return None
 
         candidates = glob.glob(os.path.join(tmpdir, f"{video_id}.*.json3"))
