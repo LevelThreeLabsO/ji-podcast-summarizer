@@ -32,6 +32,10 @@ YOUTUBE_RE = re.compile(
 PODCAST_RE = re.compile(
     r"https?://(?:open\.spotify\.com/episode|podcasts\.apple\.com)/[^\s>|]+"
 )
+TWEET_RE = re.compile(
+    r"https?://(?:www\.|mobile\.)?"
+    r"(?:twitter\.com|x\.com)/[^/\s]+/status/(\d+)"
+)
 
 SUMMARY_PROMPT = """You are analyzing a video transcript for a reporter at Jewish Insider, \
 a publication covering Jewish, Israel, and Middle East policy, politics, and community affairs. \
@@ -150,6 +154,132 @@ def yt_transcript(video_id):
         return None
 
 
+# ── Twitter/X ──────────────────────────────────────────────────────────────────
+
+def fetch_tweet(url):
+    """Fetch a tweet's text + author via Twitter's public oembed API.
+
+    Returns {"text", "author_name", "author_handle", "has_video"} or None on
+    failure (deleted / protected / suspended).
+    """
+    try:
+        r = requests.get(
+            "https://publish.twitter.com/oembed",
+            params={"url": url, "omit_script": "true", "hide_thread": "true",
+                    "dnt": "true"},
+            timeout=15,
+        )
+        if r.status_code == 404:
+            return None
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        print(f"  ! tweet fetch failed: {type(e).__name__}: {e}", file=sys.stderr)
+        return None
+
+    html_body = data.get("html", "")
+    # oembed HTML: <blockquote><p>tweet text with <a>links</a></p>&mdash; Author ...</blockquote>
+    from html import unescape
+    p_match = re.search(r"<p[^>]*>(.*?)</p>", html_body, re.DOTALL)
+    if not p_match:
+        return None
+    text = re.sub(r"<[^>]+>", " ", p_match.group(1))
+    text = unescape(text)
+    text = re.sub(r"\s+", " ", text).strip()
+
+    # Detect embedded video via the pic.twitter.com marker in the raw HTML.
+    # Cheap heuristic — oembed doesn't tell us the media type directly.
+    has_video = "video.twimg.com" in html_body or "video/" in html_body.lower()
+
+    author_name = data.get("author_name", "").strip()
+    author_url = data.get("author_url", "") or ""
+    handle_match = re.search(r"(?:twitter\.com|x\.com)/([^/]+)/?$", author_url)
+    author_handle = handle_match.group(1) if handle_match else ""
+
+    return {
+        "text": text,
+        "author_name": author_name,
+        "author_handle": author_handle,
+        "has_video": has_video,
+    }
+
+
+TWEET_PROMPT = """You are analyzing a single tweet for a reporter at Jewish Insider, a \
+publication covering Jewish, Israel, and Middle East policy, politics, and community affairs.
+
+Tweet author: {author}
+Tweet text: {text}
+
+Judge whether this tweet is news-making from a JI editorial angle. News-making means:
+  - Specific policy claim, commitment, or reversal
+  - Controversial or notable statement about Israel, Iran, Gaza, Hamas, Hezbollah, \
+antisemitism, U.S.-Israel relations, Congress, the administration, or upcoming races
+  - Scoop, revelation, or first-time-said remark
+  - Quotable pull-quote from a policymaker, expert, or public figure JI covers
+
+NOT news-making:
+  - Retweets with no added claim, generic partisan snark, unrelated topics
+  - Pleasantries, self-promotion, personal life posts, off-beat topics
+
+Return ONE JSON object:
+{{
+  "news_making": true/false,
+  "headline": "news-headline-style one-liner, action/claim-focused, 15 words max. \
+Empty string if not news-making.",
+  "why": "one short sentence on what makes this news for JI, or why it isn't."
+}}
+
+Return ONLY the JSON object. No markdown fences.
+"""
+
+
+def summarize_tweet(tweet):
+    from google import genai
+    from google.genai import types as gtypes
+
+    key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    if not key:
+        raise RuntimeError("GEMINI_API_KEY is not set")
+    client = genai.Client(api_key=key)
+
+    author = tweet["author_name"]
+    if tweet["author_handle"]:
+        author = f"{author} (@{tweet['author_handle']})"
+
+    prompt = TWEET_PROMPT.format(author=author, text=tweet["text"])
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=prompt,
+        config=gtypes.GenerateContentConfig(
+            response_mime_type="application/json",
+            max_output_tokens=512,
+        ),
+    )
+    raw = (response.text or "").strip()
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw).strip()
+        return json.loads(raw)
+
+
+def build_tweet_reply(tweet, verdict):
+    author = tweet["author_name"] or "unknown author"
+    handle = f" (@{tweet['author_handle']})" if tweet["author_handle"] else ""
+    header = f"*Tweet from {_esc(author)}{_esc(handle)}*"
+    tweet_quoted = "\n".join(f"> {_esc(line)}" for line in tweet["text"].split("\n"))
+
+    if not verdict.get("news_making"):
+        why = str(verdict.get("why", "")).strip()
+        body = f"_Not obviously news-making — {_esc(why)}_" if why else "_Not obviously news-making._"
+        return f"{header}\n\n{tweet_quoted}\n\n{body}"
+
+    headline = _esc(str(verdict.get("headline", "")).strip())
+    return f"{header}\n\n📌 {headline}\n\n{tweet_quoted}"
+
+
+# ── YouTube helpers (continued) ────────────────────────────────────────────────
+
 def format_transcript_for_llm(segments):
     """Convert transcript segments into timestamped lines for the LLM."""
     lines = []
@@ -234,8 +364,9 @@ def save_state(state):
 # ── URL processing ─────────────────────────────────────────────────────────────
 
 def process_url(url, dry_run=False, slack=None, thread_ts=None):
-    """Fetch transcript, summarize, format reply. Optionally post to Slack."""
+    """Fetch transcript/tweet, summarize, format reply. Optionally post to Slack."""
     yt_match = YOUTUBE_RE.search(url)
+    tweet_match = TWEET_RE.search(url)
     pod_match = PODCAST_RE.search(url)
 
     if yt_match:
@@ -251,11 +382,24 @@ def process_url(url, dry_run=False, slack=None, thread_ts=None):
             moments = summarize(transcript_text, title)
             print(f"  → {len(moments)} notable moments")
             reply = build_reply(title, moments)
+    elif tweet_match:
+        tweet_id = tweet_match.group(1)
+        print(f"  → Tweet {tweet_id}")
+        tweet = fetch_tweet(url)
+        if not tweet:
+            reply = "Couldn't fetch that tweet — it may be deleted, protected, or from a suspended account."
+        elif tweet["has_video"] and len(tweet["text"]) < 40:
+            # Likely a video tweet with minimal caption — Whisper needed.
+            reply = "This tweet has an embedded video — video transcription is coming in v2."
+        else:
+            verdict = summarize_tweet(tweet)
+            print(f"  → news_making={verdict.get('news_making')}")
+            reply = build_tweet_reply(tweet, verdict)
     elif pod_match:
         reply = (
             "Podcast transcript summaries are coming in v2 — for now this bot "
-            "only handles YouTube. (Spotify/Apple Podcasts don't expose free "
-            "transcripts, so we'd need to add Whisper.)"
+            "only handles YouTube and X/Twitter. (Spotify/Apple Podcasts don't "
+            "expose free transcripts, so we'd need to add Whisper.)"
         )
     else:
         return None  # no supported URL
@@ -315,7 +459,7 @@ def main():
         if msg.get("user") == bot_user_id or msg.get("bot_id"):
             continue
         text = msg.get("text", "") or ""
-        if not (YOUTUBE_RE.search(text) or PODCAST_RE.search(text)):
+        if not (YOUTUBE_RE.search(text) or TWEET_RE.search(text) or PODCAST_RE.search(text)):
             continue
 
         # Baseline the very first run: mark as processed but don't post.
@@ -325,7 +469,7 @@ def main():
             continue
 
         # First supported URL per message — one summary per post.
-        url_match = YOUTUBE_RE.search(text) or PODCAST_RE.search(text)
+        url_match = YOUTUBE_RE.search(text) or TWEET_RE.search(text) or PODCAST_RE.search(text)
         url = url_match.group(0)
         print(f"[{ts}] processing: {url}")
         try:
