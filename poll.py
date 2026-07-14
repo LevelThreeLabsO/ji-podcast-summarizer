@@ -137,17 +137,23 @@ def yt_title(video_id):
 
 def _write_cookies_file():
     """If YT_COOKIES_B64 is set, decode it to a temp cookies.txt and return the
-    path. Otherwise return None. Used to make yt-dlp requests look like a signed-in
-    YouTube user — needed when residential IPs are blocked. Optional; without it
-    yt-dlp tries anonymously and often succeeds anyway."""
+    path. Otherwise return None. The secret is gzipped-then-base64 (needed to fit
+    Chrome's YouTube+Google cookies under GH's 48KB secret cap). Used to make
+    yt-dlp look like a signed-in YouTube user from GH Actions cloud IPs."""
     import base64
+    import gzip
     import tempfile
 
     b64 = os.environ.get("YT_COOKIES_B64")
     if not b64:
         return None
     try:
-        raw = base64.b64decode(b64).decode("utf-8", errors="replace")
+        blob = base64.b64decode(b64)
+        # Try gzip first; fall back to raw if the secret wasn't gzipped.
+        try:
+            raw = gzip.decompress(blob).decode("utf-8", errors="replace")
+        except (OSError, gzip.BadGzipFile):
+            raw = blob.decode("utf-8", errors="replace")
         f = tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False)
         f.write(raw)
         f.close()
