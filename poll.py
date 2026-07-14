@@ -121,7 +121,7 @@ class Slack:
 # ── YouTube ────────────────────────────────────────────────────────────────────
 
 def yt_title(video_id):
-    """No-auth title fetch via oEmbed. Falls back to yt-dlp if oembed fails."""
+    """No-auth title fetch via oEmbed. Returns 'video' on failure."""
     try:
         r = requests.get(
             "https://www.youtube.com/oembed",
@@ -132,123 +132,42 @@ def yt_title(video_id):
             return r.json().get("title", "video")
     except Exception:
         pass
-    return yt_title_via_ytdlp(video_id)
+    return "video"
 
 
-def _write_cookies_file():
-    """If YT_COOKIES_B64 is set, decode it to a temp cookies.txt and return the
-    path. Otherwise return None. The secret is gzipped-then-base64 (needed to fit
-    Chrome's YouTube+Google cookies under GH's 48KB secret cap). Used to make
-    yt-dlp look like a signed-in YouTube user from GH Actions cloud IPs."""
-    import base64
-    import gzip
-    import tempfile
-
-    b64 = os.environ.get("YT_COOKIES_B64")
-    if not b64:
-        return None
-    try:
-        blob = base64.b64decode(b64)
-        # Try gzip first; fall back to raw if the secret wasn't gzipped.
-        try:
-            raw = gzip.decompress(blob).decode("utf-8", errors="replace")
-        except (OSError, gzip.BadGzipFile):
-            raw = blob.decode("utf-8", errors="replace")
-        f = tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False)
-        f.write(raw)
-        f.close()
-        return f.name
-    except Exception as e:
-        print(f"  ! couldn't decode YT_COOKIES_B64: {type(e).__name__}: {e}",
-              file=sys.stderr)
-        return None
-
-
-def _parse_json3_subs(path):
-    """Parse yt-dlp's json3 subtitle format into [{text, start, duration}]."""
-    with open(path) as f:
-        data = json.load(f)
-    out = []
-    for event in data.get("events", []):
-        start = (event.get("tStartMs", 0) or 0) / 1000.0
-        duration = (event.get("dDurationMs", 0) or 0) / 1000.0
-        parts = []
-        for seg in event.get("segs", []) or []:
-            if "utf8" in seg:
-                parts.append(seg["utf8"])
-        text = "".join(parts).replace("\n", " ").strip()
-        if text:
-            out.append({"text": text, "start": start, "duration": duration})
-    return out
-
-
-def yt_transcript(video_id):
-    """Fetch YouTube transcript via the yt-dlp CLI. Returns [{text, start,
-    duration}] or None.
-
-    Uses subprocess rather than the Python library — the CLI handles format
-    selection cleanly with --skip-download, while the library's programmatic
-    interface stumbles on the format-selector even when we don't want the video.
-    Same tool ClipMaker uses on the Mac; if YT_COOKIES_B64 is set we pass those
-    cookies so YouTube treats us as a signed-in user.
+def yt_transcript_via_clipmaker(url):
+    """Fetch YouTube transcript by POSTing to ClipMaker's /api/transcript on the
+    user's Mac (exposed via a public tunnel). Bot lives in GH Actions cloud where
+    YouTube blocks yt-dlp; ClipMaker on the Mac uses a residential IP and works
+    reliably. Returns ({segments}, title, error).
     """
-    import glob
-    import subprocess
-    import tempfile
+    base = os.environ.get("CLIPMAKER_URL", "").rstrip("/")
+    if not base:
+        return None, None, "CLIPMAKER_URL is not set"
+    token = os.environ.get("CLIPMAKER_AUTH_TOKEN") or ""
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
 
-    url = f"https://www.youtube.com/watch?v={video_id}"
-    cookies_path = _write_cookies_file()
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        outtmpl = os.path.join(tmpdir, "%(id)s")
-        cmd = [
-            "yt-dlp",
-            "--skip-download",
-            "--write-auto-subs",
-            "--sub-langs", "en,en-orig,en-US,en-GB",
-            "--sub-format", "json3",
-            # YouTube requires a JS challenge solver as of mid-2026.
-            # Uses the deno-based solver — deno is installed as a workflow step.
-            "--remote-components", "ejs:github",
-            "-o", outtmpl,
-            url,
-        ]
-        if cookies_path:
-            cmd[1:1] = ["--cookies", cookies_path]
-
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        if proc.returncode != 0:
-            # Print full stderr — warnings above the ERROR line are the useful ones
-            # (challenge solver info, PO-token hints, impersonation warnings, etc.)
-            print("  ! yt-dlp failed. Full stderr:", file=sys.stderr)
-            for line in (proc.stderr or "").strip().splitlines():
-                print(f"    {line}", file=sys.stderr)
-            return None
-
-        candidates = glob.glob(os.path.join(tmpdir, f"{video_id}.*.json3"))
-        if not candidates:
-            print(f"  ! yt-dlp produced no subtitle file for {video_id}", file=sys.stderr)
-            return None
-        try:
-            return _parse_json3_subs(candidates[0])
-        except Exception as e:
-            print(f"  ! subtitle parse failed: {type(e).__name__}: {e}", file=sys.stderr)
-            return None
-
-
-def yt_title_via_ytdlp(video_id):
-    """Fallback title fetch via yt-dlp CLI (uses cookies if available)."""
-    import subprocess
-    url = f"https://www.youtube.com/watch?v={video_id}"
-    cookies_path = _write_cookies_file()
-    cmd = ["yt-dlp", "--skip-download", "--print", "title", url]
-    if cookies_path:
-        cmd[1:1] = ["--cookies", cookies_path]
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        return proc.stdout.strip().splitlines()[0] if proc.returncode == 0 else "video"
-    except Exception:
-        return "video"
+        r = requests.post(f"{base}/api/transcript",
+                          headers=headers, json={"url": url}, timeout=200)
+    except requests.exceptions.RequestException as e:
+        return None, None, f"ClipMaker unreachable — is your Mac on and the tunnel running? ({type(e).__name__})"
+
+    if r.status_code == 401:
+        return None, None, "ClipMaker rejected the auth token"
+    if r.status_code >= 500:
+        try:
+            msg = r.json().get("error", r.text[:200])
+        except Exception:
+            msg = r.text[:200]
+        return None, None, f"ClipMaker error: {msg}"
+    if not r.ok:
+        return None, None, f"HTTP {r.status_code}: {r.text[:200]}"
+
+    data = r.json()
+    return data.get("segments") or [], data.get("title") or "video", None
 
 
 # ── Twitter/X ──────────────────────────────────────────────────────────────────
@@ -469,9 +388,13 @@ def process_url(url, dry_run=False, slack=None, thread_ts=None):
     if yt_match:
         video_id = yt_match.group(1)
         print(f"  → YouTube video {video_id}")
-        title = yt_title(video_id)
-        segments = yt_transcript(video_id)
-        if not segments:
+        segments, cm_title, err = yt_transcript_via_clipmaker(url)
+        # Prefer the title ClipMaker gave us; fall back to oembed if it's the
+        # generic 'video' placeholder.
+        title = cm_title if cm_title and cm_title != "video" else yt_title(video_id)
+        if err:
+            reply = f"Couldn't summarize *{_esc(title)}* — {_esc(err)}"
+        elif not segments:
             reply = f"Couldn't fetch a transcript for *{_esc(title)}* — the video may not have English captions."
         else:
             transcript_text = format_transcript_for_llm(segments)

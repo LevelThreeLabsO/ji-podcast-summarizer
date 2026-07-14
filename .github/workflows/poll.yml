@@ -23,14 +23,6 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Install deno
-        # YouTube (mid-2026+) requires a JS challenge solver. yt-dlp downloads
-        # the solver script via --remote-components ejs:github, but needs a JS
-        # runtime to execute it. deno is the lightest option that works out of
-        # the box on the Ubuntu runner. Setup is ~15 sec.
-        uses: denoland/setup-deno@v2
-        with:
-          deno-version: v2.x
       - name: Install deps
         run: pip install -r requirements.txt
       - name: Poll and summarize
@@ -39,7 +31,10 @@ jobs:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          YT_COOKIES_B64: ${{ secrets.YT_COOKIES_B64 }}
+          # YouTube transcripts route through ClipMaker running on the Mac
+          # (residential IP, bypasses YouTube's cloud-IP blocking).
+          CLIPMAKER_URL: ${{ secrets.CLIPMAKER_URL }}
+          CLIPMAKER_AUTH_TOKEN: ${{ secrets.CLIPMAKER_AUTH_TOKEN }}
       - name: Commit updated state
         run: |
           git config user.name "podcast-summarizer-bot"
