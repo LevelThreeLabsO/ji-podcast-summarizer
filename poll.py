@@ -351,10 +351,10 @@ def build_reply(title, moments):
         e = int(m.get("end_min", s))
         rng = f"{s}min" if s == e else f"{s}-{e}min"
         headline = _esc(str(m.get("headline", "")).strip())
-        lines.append(f"{i}. {headline} ({rng})")
+        lines.append(f"{i}. *{headline}* ({rng})")
         quote = str(m.get("quote", "")).strip()
         if quote:
-            lines.append(f"    > “{_esc(quote)}”")
+            lines.append(f"    • “{_esc(quote)}”")
     return "\n".join(lines)
 
 
