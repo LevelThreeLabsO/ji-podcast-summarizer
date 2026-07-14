@@ -208,8 +208,9 @@ def yt_transcript(video_id):
             "--sub-langs", "en,en-orig,en-US,en-GB",
             "--sub-format", "json3",
             # YouTube requires a JS challenge solver as of mid-2026.
-            # This auto-downloads the deno-based solver on first use.
-            "--remote-components", "ejs:github",
+            # ejs:npm uses the Node.js runtime that GH Actions Ubuntu runners
+            # have preinstalled (ejs:github wants deno, which isn't preinstalled).
+            "--remote-components", "ejs:npm",
             "-o", outtmpl,
             url,
         ]
