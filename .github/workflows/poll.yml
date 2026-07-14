@@ -31,6 +31,7 @@ jobs:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          YT_COOKIES_B64: ${{ secrets.YT_COOKIES_B64 }}
       - name: Commit updated state
         run: |
           git config user.name "podcast-summarizer-bot"

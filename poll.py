@@ -135,11 +135,44 @@ def yt_title(video_id):
     return "video"
 
 
+def _build_yt_session():
+    """If YT_COOKIES_B64 is set, load those cookies into a requests.Session so
+    YouTube treats us as an authenticated user. Otherwise return None (default).
+
+    YouTube blocks unauthenticated cloud IPs aggressively; the same code that
+    works from a residential IP (e.g. ClipMaker on the user's Mac) gets a
+    RequestBlocked error from GitHub Actions. Cookies solve that.
+    """
+    import base64
+    import tempfile
+    from http.cookiejar import MozillaCookieJar
+
+    b64 = os.environ.get("YT_COOKIES_B64")
+    if not b64:
+        return None
+    try:
+        raw = base64.b64decode(b64).decode("utf-8", errors="replace")
+        # MozillaCookieJar wants a file path
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
+            f.write(raw)
+            path = f.name
+        jar = MozillaCookieJar(path)
+        jar.load(ignore_discard=True, ignore_expires=True)
+        session = requests.Session()
+        session.cookies = jar
+        return session
+    except Exception as e:
+        print(f"  ! couldn't load YT_COOKIES_B64: {type(e).__name__}: {e}",
+              file=sys.stderr)
+        return None
+
+
 def yt_transcript(video_id):
     """Fetch YouTube transcript. Returns list of {text, start, duration} or None."""
     try:
         from youtube_transcript_api import YouTubeTranscriptApi
-        api = YouTubeTranscriptApi()
+        session = _build_yt_session()
+        api = YouTubeTranscriptApi(http_client=session) if session else YouTubeTranscriptApi()
         try:
             fetched = api.fetch(video_id, languages=["en", "en-US", "en-GB"])
         except Exception:
