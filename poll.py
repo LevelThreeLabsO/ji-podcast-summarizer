@@ -264,7 +264,7 @@ def summarize_tweet(tweet):
 
     prompt = TWEET_PROMPT.format(author=author, text=tweet["text"])
     response = client.models.generate_content(
-        model="gemini-2.5-flash",
+        model="gemini-flash-latest",
         contents=prompt,
         config=gtypes.GenerateContentConfig(
             response_mime_type="application/json",
@@ -321,7 +321,7 @@ def summarize(transcript_text, video_title):
 
     prompt = SUMMARY_PROMPT.format(title=video_title, transcript=transcript_text)
     response = client.models.generate_content(
-        model="gemini-2.5-flash",
+        model="gemini-flash-latest",
         contents=prompt,
         config=gtypes.GenerateContentConfig(
             response_mime_type="application/json",
