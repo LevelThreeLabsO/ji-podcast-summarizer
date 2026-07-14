@@ -183,40 +183,43 @@ def _parse_json3_subs(path):
 
 
 def yt_transcript(video_id):
-    """Fetch YouTube transcript via yt-dlp. Returns [{text, start, duration}] or None.
+    """Fetch YouTube transcript via the yt-dlp CLI. Returns [{text, start,
+    duration}] or None.
 
-    Same tool ClipMaker uses on the user's Mac. Much more resilient to blocking
-    than youtube-transcript-api's raw HTTP calls. If YT_COOKIES_B64 is set, uses
-    those cookies to authenticate.
+    Uses subprocess rather than the Python library — the CLI handles format
+    selection cleanly with --skip-download, while the library's programmatic
+    interface stumbles on the format-selector even when we don't want the video.
+    Same tool ClipMaker uses on the Mac; if YT_COOKIES_B64 is set we pass those
+    cookies so YouTube treats us as a signed-in user.
     """
     import glob
+    import subprocess
     import tempfile
-    import yt_dlp
 
     url = f"https://www.youtube.com/watch?v={video_id}"
     cookies_path = _write_cookies_file()
 
     with tempfile.TemporaryDirectory() as tmpdir:
         outtmpl = os.path.join(tmpdir, "%(id)s")
-        opts = {
-            "skip_download": True,
-            "writeautomaticsub": True,   # auto-generated captions
-            "writesubtitles": True,       # human captions (preferred)
-            "subtitleslangs": ["en", "en-orig", "en-US", "en-GB"],
-            "subtitlesformat": "json3",   # structured with timings
-            "outtmpl": outtmpl,
-            "quiet": True,
-            "no_warnings": True,
-            "ignoreerrors": False,
-        }
+        cmd = [
+            "yt-dlp",
+            "--skip-download",
+            "--write-auto-subs",
+            "--sub-langs", "en,en-orig,en-US,en-GB",
+            "--sub-format", "json3",
+            # YouTube requires a JS challenge solver as of mid-2026.
+            # This auto-downloads the deno-based solver on first use.
+            "--remote-components", "ejs:github",
+            "-o", outtmpl,
+            url,
+        ]
         if cookies_path:
-            opts["cookiefile"] = cookies_path
+            cmd[1:1] = ["--cookies", cookies_path]
 
-        try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                ydl.download([url])
-        except Exception as e:
-            print(f"  ! yt-dlp download failed: {type(e).__name__}: {e}", file=sys.stderr)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if proc.returncode != 0:
+            print(f"  ! yt-dlp failed: {proc.stderr.strip().splitlines()[-1] if proc.stderr else 'unknown'}",
+                  file=sys.stderr)
             return None
 
         candidates = glob.glob(os.path.join(tmpdir, f"{video_id}.*.json3"))
@@ -231,17 +234,16 @@ def yt_transcript(video_id):
 
 
 def yt_title_via_ytdlp(video_id):
-    """Fallback title fetch via yt-dlp (uses cookies if available)."""
-    import yt_dlp
+    """Fallback title fetch via yt-dlp CLI (uses cookies if available)."""
+    import subprocess
     url = f"https://www.youtube.com/watch?v={video_id}"
     cookies_path = _write_cookies_file()
-    opts = {"skip_download": True, "quiet": True, "no_warnings": True}
+    cmd = ["yt-dlp", "--skip-download", "--print", "title", url]
     if cookies_path:
-        opts["cookiefile"] = cookies_path
+        cmd[1:1] = ["--cookies", cookies_path]
     try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-        return (info or {}).get("title") or "video"
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        return proc.stdout.strip().splitlines()[0] if proc.returncode == 0 else "video"
     except Exception:
         return "video"
 
