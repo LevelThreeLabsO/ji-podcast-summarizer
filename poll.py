@@ -250,27 +250,11 @@ Return ONLY the JSON object. No markdown fences.
 
 
 def summarize_tweet(tweet):
-    from google import genai
-    from google.genai import types as gtypes
-
-    key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-    if not key:
-        raise RuntimeError("GEMINI_API_KEY is not set")
-    client = genai.Client(api_key=key)
-
     author = tweet["author_name"]
     if tweet["author_handle"]:
         author = f"{author} (@{tweet['author_handle']})"
-
     prompt = TWEET_PROMPT.format(author=author, text=tweet["text"])
-    response = client.models.generate_content(
-        model="gemini-flash-latest",
-        contents=prompt,
-        config=gtypes.GenerateContentConfig(
-            response_mime_type="application/json",
-            max_output_tokens=512,
-        ),
-    )
+    response = _gemini_generate_with_retry(prompt, max_tokens=512)
     raw = (response.text or "").strip()
     try:
         return json.loads(raw)
@@ -310,29 +294,52 @@ def format_transcript_for_llm(segments):
 
 # ── Gemini summarizer ──────────────────────────────────────────────────────────
 
-def summarize(transcript_text, video_title):
+def _gemini_generate_with_retry(prompt, max_tokens=4096):
+    """Call Gemini with retries + model fallback. Gemini's 'flash-latest' can
+    hit 503 UNAVAILABLE (high demand). We retry with backoff, and if the fast
+    model keeps failing, fall back to a lite variant."""
     from google import genai
     from google.genai import types as gtypes
+    from google.genai import errors as gerrors
 
     key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
     if not key:
         raise RuntimeError("GEMINI_API_KEY is not set")
     client = genai.Client(api_key=key)
 
-    prompt = SUMMARY_PROMPT.format(title=video_title, transcript=transcript_text)
-    response = client.models.generate_content(
-        model="gemini-flash-latest",
-        contents=prompt,
-        config=gtypes.GenerateContentConfig(
-            response_mime_type="application/json",
-            max_output_tokens=4096,
-        ),
+    # Order: main model, then a lite fallback that's usually less contended.
+    models = ["gemini-flash-latest", "gemini-flash-lite-latest"]
+    config = gtypes.GenerateContentConfig(
+        response_mime_type="application/json",
+        max_output_tokens=max_tokens,
     )
+
+    last_err = None
+    for model in models:
+        for attempt in range(3):
+            try:
+                return client.models.generate_content(
+                    model=model, contents=prompt, config=config,
+                )
+            except (gerrors.ServerError, gerrors.APIError) as e:
+                last_err = e
+                # Sleep 4s, 12s before the next attempt within the same model.
+                if attempt < 2:
+                    time.sleep(4 * (attempt * 2 + 1))
+                    continue
+                # Otherwise fall through to the next model.
+                break
+    # If we're here, everything failed.
+    raise last_err if last_err else RuntimeError("Gemini call failed for unknown reason")
+
+
+def summarize(transcript_text, video_title):
+    prompt = SUMMARY_PROMPT.format(title=video_title, transcript=transcript_text)
+    response = _gemini_generate_with_retry(prompt, max_tokens=4096)
     raw = (response.text or "").strip()
     try:
         moments = json.loads(raw)
     except json.JSONDecodeError:
-        # Strip any markdown fences and retry
         raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw).strip()
         moments = json.loads(raw)
     if not isinstance(moments, list):
