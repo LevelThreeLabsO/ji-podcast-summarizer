@@ -467,25 +467,39 @@ def main():
     print(f"  → {len(messages)} messages in window")
 
     processed = set(state.get("processed_ts", []))
-    max_ts = float(since)
+    # Track the newest ts we can safely advance the polling window past.
+    # We only advance past a message if it's been fully handled (processed,
+    # baseline-skipped, or contains no URL we care about). If a message
+    # failed, `advanceable_ts` freezes at the previous value so next tick
+    # will re-fetch that message and retry.
+    advanceable_ts = float(since)
+    any_failed = False
 
     # Slack returns newest-first — process oldest-first so replies land in order.
     for msg in reversed(messages):
         ts = msg["ts"]
-        max_ts = max(max_ts, float(ts))
+        ts_f = float(ts)
         if ts in processed:
+            if not any_failed:
+                advanceable_ts = max(advanceable_ts, ts_f)
             continue
         # Skip messages from the bot itself + other bots.
         if msg.get("user") == bot_user_id or msg.get("bot_id"):
+            if not any_failed:
+                advanceable_ts = max(advanceable_ts, ts_f)
             continue
         text = msg.get("text", "") or ""
         if not (YOUTUBE_RE.search(text) or TWEET_RE.search(text) or PODCAST_RE.search(text)):
+            if not any_failed:
+                advanceable_ts = max(advanceable_ts, ts_f)
             continue
 
         # Baseline the very first run: mark as processed but don't post.
         if first_run and not args.dry_run:
             print(f"  (baseline) skip {ts}")
             processed.add(ts)
+            if not any_failed:
+                advanceable_ts = max(advanceable_ts, ts_f)
             continue
 
         # First supported URL per message — one summary per post.
@@ -495,12 +509,16 @@ def main():
         try:
             process_url(url, dry_run=args.dry_run, slack=slack, thread_ts=ts)
             processed.add(ts)
+            if not any_failed:
+                advanceable_ts = max(advanceable_ts, ts_f)
         except Exception as e:
             print(f"  ! failed: {type(e).__name__}: {e}", file=sys.stderr)
-            # Don't add to processed — retry next tick.
+            # Don't add to processed and freeze the window here so next tick
+            # re-fetches this message and retries it.
+            any_failed = True
 
     if not args.dry_run:
-        state["last_ts"] = f"{max_ts:.6f}"
+        state["last_ts"] = f"{advanceable_ts:.6f}"
         state["processed_ts"] = sorted(processed)[-500:]  # cap size
         save_state(state)
 
