@@ -106,9 +106,13 @@ class Slack:
         })
 
     def post_reply(self, thread_ts, text):
+        # reply_broadcast: post as a thread reply AND surface it in the main
+        # channel feed so people scanning the channel see it without opening
+        # the thread.
         return self._call("chat.postMessage", json_body={
             "channel": self.channel,
             "thread_ts": thread_ts,
+            "reply_broadcast": True,
             "text": text,
             "unfurl_links": False,
             "unfurl_media": False,
