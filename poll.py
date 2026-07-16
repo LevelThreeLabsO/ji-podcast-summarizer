@@ -66,17 +66,15 @@ Return a JSON array of 3-6 items. Each item:
   "quote": "a direct verbatim pull-quote from the transcript, under 200 chars, or empty string if no clean one exists"
 }}
 
-Rules for the headline (this is the important part — most current summaries are too vague):
-  - INCLUDE named specifics whenever they're in the transcript: which people, which groups/orgs \
-by name, which bill numbers, which countries, which dollar amounts, which dates. \
-Don't say "four far-left groups" — name them. Don't say "a senator" — name the senator. \
-Don't say "a Middle East country" — name the country.
+Rules for the headline:
+  - Name specifics when it's reliable to do so — which people, which groups/orgs, which \
+bill numbers, which countries, which dollar amounts, which dates. If a specific is clearly \
+stated in the transcript, include it. If it isn't, don't invent one and don't guess; leave \
+it out or hedge honestly (e.g. "an unnamed group", "several senators").
   - Active voice, claim-focused. Aim for 20-30 words if the specifics need it. \
-Do not sacrifice specifics for word count.
+Do not sacrifice a reliable specific to hit a word count.
   - No filler ("discusses", "talks about", "mentions") — go straight to what was said/claimed.
   - Bracketed clarifier OK if extra context is needed, e.g. "(related to Platner)".
-  - If the transcript is vague on a specific ("some group", "a few people"), reflect that in \
-the headline rather than inventing detail. Never fabricate specifics.
 
 Rules for the quote:
   - Must appear VERBATIM in the transcript — do not paraphrase, condense, or clean up.
