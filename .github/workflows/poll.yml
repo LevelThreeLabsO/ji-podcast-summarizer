@@ -42,11 +42,18 @@ jobs:
           git config user.email "bot@users.noreply.github.com"
           git add watcher_state.json
           if git diff --cached --quiet; then
-            echo "no state changes"
-          else
-            git commit -m "Update watcher state"
-            git push
+            echo "no state changes"; exit 0
           fi
+          git commit -m "Update watcher state [skip ci]"
+          # Retry on a non-fast-forward race (another run or commit moved main).
+          # On a state-file conflict, keep the remote's version (-X ours during
+          # rebase = prefer upstream) so we never roll the watermark backward.
+          for i in 1 2 3 4 5; do
+            if git push; then echo "pushed on try $i"; exit 0; fi
+            echo "push rejected — rebasing onto latest main (try $i)"
+            git pull --rebase -X ours --autostash origin main || git rebase --abort
+          done
+          echo "could not push state after 5 tries"; exit 1
       - name: Alert Slack if the run failed
         if: failure()
         run: |
