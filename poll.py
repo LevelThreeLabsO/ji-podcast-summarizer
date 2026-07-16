@@ -60,17 +60,29 @@ TRANSCRIPT (with [MM:SS] timestamps):
 
 Return a JSON array of 3-6 items. Each item:
 {{
-  "headline": "news-headline-style one-liner, action/claim-focused, 15 words max, no filler",
+  "headline": "news-headline-style one-liner packed with the specifics a JI editor would want at-a-glance",
   "start_min": <int minute>,
   "end_min": <int minute>,
   "quote": "a direct verbatim pull-quote from the transcript, under 200 chars, or empty string if no clean one exists"
 }}
 
-Rules:
-  - start_min/end_min: the rough minute-range the moment spans. If a single point, they're equal.
-  - headline uses active voice and specific claims. Bracketed clarifier OK if needed \
-(e.g. "(related to Platner)").
-  - quote must appear verbatim in the transcript. Do not paraphrase in the quote field.
+Rules for the headline (this is the important part — most current summaries are too vague):
+  - INCLUDE named specifics whenever they're in the transcript: which people, which groups/orgs \
+by name, which bill numbers, which countries, which dollar amounts, which dates. \
+Don't say "four far-left groups" — name them. Don't say "a senator" — name the senator. \
+Don't say "a Middle East country" — name the country.
+  - Active voice, claim-focused. Aim for 20-30 words if the specifics need it. \
+Do not sacrifice specifics for word count.
+  - No filler ("discusses", "talks about", "mentions") — go straight to what was said/claimed.
+  - Bracketed clarifier OK if extra context is needed, e.g. "(related to Platner)".
+  - If the transcript is vague on a specific ("some group", "a few people"), reflect that in \
+the headline rather than inventing detail. Never fabricate specifics.
+
+Rules for the quote:
+  - Must appear VERBATIM in the transcript — do not paraphrase, condense, or clean up.
+  - Under 200 chars. If no clean stand-alone pull-quote exists, empty string.
+
+Other:
   - If there are truly no notable moments, return [].
   - Return ONLY the JSON array. No markdown fences, no explanation.
 """
