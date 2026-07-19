@@ -36,6 +36,9 @@ TWEET_RE = re.compile(
     r"https?://(?:www\.|mobile\.)?"
     r"(?:twitter\.com|x\.com)/[^/\s]+/status/(\d+)"
 )
+# Generic http(s) URL — used as a fallback for news articles etc. Comes LAST
+# in dispatch so YT/Twitter/podcast URLs take priority.
+ARTICLE_RE = re.compile(r"https?://[^\s>|<]+")
 
 SUMMARY_PROMPT = """You are analyzing a video transcript for a reporter at Jewish Insider, \
 a publication covering Jewish, Israel, and Middle East policy, politics, and community affairs. \
@@ -115,14 +118,15 @@ class Slack:
             "inclusive": "false",
         })
 
-    def post_reply(self, thread_ts, text):
-        # reply_broadcast: post as a thread reply AND surface it in the main
-        # channel feed so people scanning the channel see it without opening
-        # the thread.
+    def post_reply(self, thread_ts, text, broadcast=False):
+        # broadcast=True: also surface the message in the main channel feed
+        # (used for real summaries). broadcast=False: quiet thread-only reply
+        # (used for "couldn't summarize" / "not supported" notices so they
+        # don't clutter the channel).
         return self._call("chat.postMessage", json_body={
             "channel": self.channel,
             "thread_ts": thread_ts,
-            "reply_broadcast": True,
+            "reply_broadcast": broadcast,
             "text": text,
             "unfurl_links": False,
             "unfurl_media": False,
@@ -361,6 +365,129 @@ def summarize(transcript_text, video_title):
     return moments
 
 
+# ── Article fetch + summary ────────────────────────────────────────────────────
+
+ARTICLE_PROMPT = """You are analyzing a news article for a reporter at Jewish Insider, \
+a publication covering Jewish, Israel, and Middle East policy, politics, and community affairs. \
+Surface the NOTABLE POINTS a JI editor would flag in Slack.
+
+What counts as notable — same JI-beat rubric as our video summaries:
+  - Specific policy claims, commitments, or reversals
+  - News-making statements on Israel, Iran, Gaza, Hamas, Hezbollah, antisemitism, \
+U.S.-Israel relations, Congress, the administration, upcoming races
+  - Quotable pull-quotes that stand on their own
+  - Scoops, revelations, first-time-said remarks
+
+Article title: {title}
+
+ARTICLE TEXT:
+{text}
+
+Return a JSON array of 3-6 items. Each item:
+{{
+  "headline": "news-headline-style one-liner packed with specifics a JI editor would want at-a-glance",
+  "quote": "a direct verbatim pull-quote from the article, under 200 chars, or empty string if no clean one exists"
+}}
+
+Rules for the headline:
+  - Name specifics when reliable — which people, which groups/orgs, which bill numbers, which \
+countries, which dollar amounts, which dates. If a specific is clearly stated in the article, \
+include it. If it isn't, don't invent one; leave it out or hedge honestly.
+  - Active voice, claim-focused. 20-30 words if specifics need it. No filler.
+
+Rules for the quote:
+  - Must appear VERBATIM in the article text — do not paraphrase or clean up.
+  - Under 200 chars. Empty string if no clean pull-quote exists.
+
+If there are truly no notable moments, return [].
+Return ONLY the JSON array. No markdown fences.
+"""
+
+
+# Curated User-Agent — real Chrome string, less likely to be blocked than a bare requests default.
+_BROWSER_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+               "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36")
+
+
+def fetch_article(url):
+    """Fetch and extract article text. Returns {"title", "text"} or None.
+
+    Works well for most news sites (CNN, AP, Politico, Axios, etc.). Fails on
+    aggressive paywalls (NYTimes, WaPo, WSJ) that require auth cookies.
+    """
+    try:
+        import trafilatura
+    except ImportError:
+        print("  ! trafilatura not installed", file=sys.stderr)
+        return None
+
+    try:
+        r = requests.get(
+            url,
+            headers={"User-Agent": _BROWSER_UA,
+                     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                     "Accept-Language": "en-US,en;q=0.9"},
+            timeout=25,
+            allow_redirects=True,
+        )
+    except requests.exceptions.RequestException as e:
+        print(f"  ! article fetch failed: {type(e).__name__}: {e}", file=sys.stderr)
+        return None
+
+    if r.status_code >= 400:
+        print(f"  ! article fetch HTTP {r.status_code}", file=sys.stderr)
+        return None
+
+    try:
+        extracted = trafilatura.extract(
+            r.text, output_format="json", with_metadata=True,
+        )
+    except Exception as e:
+        print(f"  ! trafilatura extract failed: {type(e).__name__}: {e}", file=sys.stderr)
+        return None
+    if not extracted:
+        return None
+    try:
+        data = json.loads(extracted)
+    except json.JSONDecodeError:
+        return None
+    text = (data.get("text") or "").strip()
+    if len(text) < 300:
+        # Anything shorter than ~300 chars is almost certainly a paywall stub
+        # or a "please enable JS" placeholder — not a real article.
+        return None
+    return {"title": (data.get("title") or "").strip(), "text": text}
+
+
+def summarize_article(text, article_title):
+    prompt = ARTICLE_PROMPT.format(title=article_title, text=text[:60000])
+    response = _gemini_generate_with_retry(prompt, max_tokens=4096)
+    raw = (response.text or "").strip()
+    try:
+        moments = json.loads(raw)
+    except json.JSONDecodeError:
+        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw).strip()
+        moments = json.loads(raw)
+    if not isinstance(moments, list):
+        return []
+    return moments
+
+
+def build_article_reply(title, url, moments):
+    if not moments:
+        return f"Scanned *{_esc(title)}* — no clearly news-making points jumped out."
+    from urllib.parse import urlparse
+    host = urlparse(url).netloc.replace("www.", "")
+    lines = [f"*Notable Points from “{_esc(title)}”* _({_esc(host)})_", ""]
+    for i, m in enumerate(moments, 1):
+        headline = _esc(str(m.get("headline", "")).strip())
+        lines.append(f"{i}. *{headline}*")
+        quote = str(m.get("quote", "")).strip()
+        if quote:
+            lines.append(f"    • “{_esc(quote)}”")
+    return "\n".join(lines)
+
+
 # ── Reply formatting ───────────────────────────────────────────────────────────
 
 def build_reply(title, moments):
@@ -401,17 +528,23 @@ def save_state(state):
 # ── URL processing ─────────────────────────────────────────────────────────────
 
 def process_url(url, dry_run=False, slack=None, thread_ts=None):
-    """Fetch transcript/tweet, summarize, format reply. Optionally post to Slack."""
+    """Fetch transcript/tweet/article, summarize, format reply, post to Slack.
+
+    Returns (reply_text, is_summary) or (None, False) if no supported URL.
+    is_summary=True only when we produced a real Notable-Moments-style summary
+    (used to decide whether to broadcast to the channel or keep in the thread).
+    """
     yt_match = YOUTUBE_RE.search(url)
     tweet_match = TWEET_RE.search(url)
     pod_match = PODCAST_RE.search(url)
+    article_match = ARTICLE_RE.search(url) if not (yt_match or tweet_match or pod_match) else None
+
+    is_summary = False
 
     if yt_match:
         video_id = yt_match.group(1)
         print(f"  → YouTube video {video_id}")
         segments, cm_title, err = yt_transcript_via_clipmaker(url)
-        # Prefer the title ClipMaker gave us; fall back to oembed if it's the
-        # generic 'video' placeholder.
         title = cm_title if cm_title and cm_title != "video" else yt_title(video_id)
         if err:
             reply = f"Couldn't summarize *{_esc(title)}* — {_esc(err)}"
@@ -423,6 +556,7 @@ def process_url(url, dry_run=False, slack=None, thread_ts=None):
             moments = summarize(transcript_text, title)
             print(f"  → {len(moments)} notable moments")
             reply = build_reply(title, moments)
+            is_summary = bool(moments)
     elif tweet_match:
         tweet_id = tweet_match.group(1)
         print(f"  → Tweet {tweet_id}")
@@ -430,29 +564,40 @@ def process_url(url, dry_run=False, slack=None, thread_ts=None):
         if not tweet:
             reply = "Couldn't fetch that tweet — it may be deleted, protected, or from a suspended account."
         elif tweet["has_video"] and len(tweet["text"]) < 40:
-            # Likely a video tweet with minimal caption — Whisper needed.
             reply = "This tweet has an embedded video — video transcription is coming in v2."
         else:
             verdict = summarize_tweet(tweet)
             print(f"  → news_making={verdict.get('news_making')}")
             reply = build_tweet_reply(tweet, verdict)
+            is_summary = bool(verdict.get("news_making"))
+    elif article_match:
+        print(f"  → Article {url}")
+        article = fetch_article(url)
+        if not article:
+            reply = "Couldn't extract the article text — the site may block scrapers or be paywalled."
+        else:
+            title = article["title"] or url
+            print(f"  → {len(article['text'])} chars of article text")
+            moments = summarize_article(article["text"], title)
+            print(f"  → {len(moments)} notable moments")
+            reply = build_article_reply(title, url, moments)
+            is_summary = bool(moments)
     elif pod_match:
         reply = (
             "Podcast transcript summaries are coming in v2 — for now this bot "
-            "only handles YouTube and X/Twitter. (Spotify/Apple Podcasts don't "
-            "expose free transcripts, so we'd need to add Whisper.)"
+            "only handles YouTube, X/Twitter, and news articles."
         )
     else:
-        return None  # no supported URL
+        return None, False
 
     if dry_run or not slack:
         print("--- REPLY ---")
         print(reply)
         print("-------------")
     else:
-        slack.post_reply(thread_ts, reply)
-        print(f"  → posted reply in thread {thread_ts}")
-    return reply
+        slack.post_reply(thread_ts, reply, broadcast=is_summary)
+        print(f"  → posted reply in thread {thread_ts} (broadcast={is_summary})")
+    return reply, is_summary
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
@@ -510,7 +655,7 @@ def main():
                 advanceable_ts = max(advanceable_ts, ts_f)
             continue
         text = msg.get("text", "") or ""
-        if not (YOUTUBE_RE.search(text) or TWEET_RE.search(text) or PODCAST_RE.search(text)):
+        if not (YOUTUBE_RE.search(text) or TWEET_RE.search(text) or PODCAST_RE.search(text) or ARTICLE_RE.search(text)):
             if not any_failed:
                 advanceable_ts = max(advanceable_ts, ts_f)
             continue
@@ -524,7 +669,7 @@ def main():
             continue
 
         # First supported URL per message — one summary per post.
-        url_match = YOUTUBE_RE.search(text) or TWEET_RE.search(text) or PODCAST_RE.search(text)
+        url_match = YOUTUBE_RE.search(text) or TWEET_RE.search(text) or PODCAST_RE.search(text) or ARTICLE_RE.search(text)
         url = url_match.group(0)
         print(f"[{ts}] processing: {url}")
         try:
