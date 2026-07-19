@@ -118,6 +118,26 @@ class Slack:
             "inclusive": "false",
         })
 
+    def thread_has_bot_reply(self, thread_ts, bot_user_id=None):
+        """Return True if this bot (or any bot) has already replied in-thread.
+        Belt-and-suspenders check to prevent duplicate summaries from state-race
+        conditions between workflow runs."""
+        try:
+            r = self._call("conversations.replies", params={
+                "channel": self.channel,
+                "ts": thread_ts,
+                "limit": 20,
+            })
+        except Exception:
+            return False  # on error, don't block posting
+        # Skip the parent message (index 0); any reply from us or another bot counts.
+        for m in r.get("messages", [])[1:]:
+            if bot_user_id and m.get("user") == bot_user_id:
+                return True
+            if m.get("bot_id"):
+                return True
+        return False
+
     def post_reply(self, thread_ts, text, broadcast=False):
         # broadcast=True: also surface the message in the main channel feed
         # (used for real summaries). broadcast=False: quiet thread-only reply
@@ -699,6 +719,16 @@ def main():
         # Baseline the very first run: mark as processed but don't post.
         if first_run and not args.dry_run:
             print(f"  (baseline) skip {ts}")
+            processed.add(ts)
+            if not any_failed:
+                advanceable_ts = max(advanceable_ts, ts_f)
+            continue
+
+        # Belt-and-suspenders duplicate-prevention: if the bot already replied
+        # in this thread (from a prior workflow run whose state-commit lost a
+        # race, etc.), skip. Marks as processed so we don't keep re-checking.
+        if not args.dry_run and slack.thread_has_bot_reply(ts, bot_user_id):
+            print(f"  (already replied in-thread) skip {ts}")
             processed.add(ts)
             if not any_failed:
                 advanceable_ts = max(advanceable_ts, ts_f)
