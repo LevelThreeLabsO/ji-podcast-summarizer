@@ -527,66 +527,102 @@ def save_state(state):
 
 # ── URL processing ─────────────────────────────────────────────────────────────
 
-def process_url(url, dry_run=False, slack=None, thread_ts=None):
-    """Fetch transcript/tweet/article, summarize, format reply, post to Slack.
+class TransientError(Exception):
+    """Raised when a URL couldn't be processed for a reason that will likely
+    resolve itself (Mac off, tunnel down, Gemini overloaded, network hiccup).
 
-    Returns (reply_text, is_summary) or (None, False) if no supported URL.
-    is_summary=True only when we produced a real Notable-Moments-style summary
-    (used to decide whether to broadcast to the channel or keep in the thread).
+    Bubbles to the main loop, which does NOT advance the polling window past
+    the message — so it gets retried on the next tick.
+    """
+
+
+# Substrings that indicate a ClipMaker-reachability failure vs a video-specific
+# issue. If any of these appear in the error string, treat as transient.
+_TRANSIENT_HINTS = (
+    "ClipMaker unreachable",
+    "ClipMaker rejected the auth token",
+    "CLIPMAKER_URL is not set",
+    "HTTP 5",             # any 5xx from the tunnel/ClipMaker
+    "ClipMaker error:",   # generic ClipMaker error passthrough
+)
+
+
+def _is_transient(err_str):
+    if not err_str:
+        return False
+    return any(h in err_str for h in _TRANSIENT_HINTS)
+
+
+def process_url(url, dry_run=False, slack=None, thread_ts=None):
+    """Fetch transcript/tweet/article, summarize, post to Slack.
+
+    Returns (reply_or_none, is_summary):
+      - (reply, True)  → real summary, post + broadcast, mark processed
+      - (reply, False) → non-summary content (currently unused — nothing posts
+                         on failure per the "silent retry" behavior)
+      - (None, False)  → nothing to do (unsupported URL, or nothing news-making)
+
+    Raises TransientError if the bot literally couldn't run (Mac off, Gemini
+    503, etc.) — main loop retries next tick without posting anything.
     """
     yt_match = YOUTUBE_RE.search(url)
     tweet_match = TWEET_RE.search(url)
     pod_match = PODCAST_RE.search(url)
     article_match = ARTICLE_RE.search(url) if not (yt_match or tweet_match or pod_match) else None
 
-    is_summary = False
-
     if yt_match:
         video_id = yt_match.group(1)
         print(f"  → YouTube video {video_id}")
         segments, cm_title, err = yt_transcript_via_clipmaker(url)
+        if err and _is_transient(err):
+            raise TransientError(f"YT transcript unreachable: {err}")
+        if err or not segments:
+            # Permanent-ish: no captions, video removed, etc. Skip silently.
+            print(f"  → no transcript (permanent): {err or 'no segments'}")
+            return None, False
         title = cm_title if cm_title and cm_title != "video" else yt_title(video_id)
-        if err:
-            reply = f"Couldn't summarize *{_esc(title)}* — {_esc(err)}"
-        elif not segments:
-            reply = f"Couldn't fetch a transcript for *{_esc(title)}* — the video may not have English captions."
-        else:
-            transcript_text = format_transcript_for_llm(segments)
-            print(f"  → {len(segments)} segments, ~{len(transcript_text)} chars")
-            moments = summarize(transcript_text, title)
-            print(f"  → {len(moments)} notable moments")
-            reply = build_reply(title, moments)
-            is_summary = bool(moments)
+        transcript_text = format_transcript_for_llm(segments)
+        print(f"  → {len(segments)} segments, ~{len(transcript_text)} chars")
+        moments = summarize(transcript_text, title)
+        print(f"  → {len(moments)} notable moments")
+        if not moments:
+            return None, False
+        reply = build_reply(title, moments)
+        is_summary = True
     elif tweet_match:
         tweet_id = tweet_match.group(1)
         print(f"  → Tweet {tweet_id}")
         tweet = fetch_tweet(url)
         if not tweet:
-            reply = "Couldn't fetch that tweet — it may be deleted, protected, or from a suspended account."
-        elif tweet["has_video"] and len(tweet["text"]) < 40:
-            reply = "This tweet has an embedded video — video transcription is coming in v2."
-        else:
-            verdict = summarize_tweet(tweet)
-            print(f"  → news_making={verdict.get('news_making')}")
-            reply = build_tweet_reply(tweet, verdict)
-            is_summary = bool(verdict.get("news_making"))
+            print("  → tweet fetch failed — deleted/protected/suspended (permanent)")
+            return None, False
+        if tweet["has_video"] and len(tweet["text"]) < 40:
+            print("  → video-only tweet (permanent skip until v2)")
+            return None, False
+        verdict = summarize_tweet(tweet)
+        print(f"  → news_making={verdict.get('news_making')}")
+        if not verdict.get("news_making"):
+            return None, False
+        reply = build_tweet_reply(tweet, verdict)
+        is_summary = True
     elif article_match:
         print(f"  → Article {url}")
         article = fetch_article(url)
         if not article:
-            reply = "Couldn't extract the article text — the site may block scrapers or be paywalled."
-        else:
-            title = article["title"] or url
-            print(f"  → {len(article['text'])} chars of article text")
-            moments = summarize_article(article["text"], title)
-            print(f"  → {len(moments)} notable moments")
-            reply = build_article_reply(title, url, moments)
-            is_summary = bool(moments)
+            # Paywall, JS-required site, extraction failure. Permanent skip.
+            print("  → article fetch/extract failed (paywall / permanent)")
+            return None, False
+        title = article["title"] or url
+        print(f"  → {len(article['text'])} chars of article text")
+        moments = summarize_article(article["text"], title)
+        print(f"  → {len(moments)} notable moments")
+        if not moments:
+            return None, False
+        reply = build_article_reply(title, url, moments)
+        is_summary = True
     elif pod_match:
-        reply = (
-            "Podcast transcript summaries are coming in v2 — for now this bot "
-            "only handles YouTube, X/Twitter, and news articles."
-        )
+        print("  → podcast URL — not supported yet")
+        return None, False
     else:
         return None, False
 
@@ -674,13 +710,20 @@ def main():
         print(f"[{ts}] processing: {url}")
         try:
             process_url(url, dry_run=args.dry_run, slack=slack, thread_ts=ts)
+            # Mark processed on both success AND permanent failure — bot did
+            # what it could, no point retrying (paywall won't unpaywall itself).
             processed.add(ts)
             if not any_failed:
                 advanceable_ts = max(advanceable_ts, ts_f)
+        except TransientError as e:
+            print(f"  ! transient — will retry next tick: {e}", file=sys.stderr)
+            # Silent: no reply posted, ts not marked. Next tick fetches this
+            # message again and tries again. When your Mac / tunnel / Gemini
+            # comes back, the summary posts as if nothing happened.
+            any_failed = True
         except Exception as e:
-            print(f"  ! failed: {type(e).__name__}: {e}", file=sys.stderr)
-            # Don't add to processed and freeze the window here so next tick
-            # re-fetches this message and retries it.
+            print(f"  ! unexpected failure: {type(e).__name__}: {e}", file=sys.stderr)
+            # Unknown error — treat as transient to be safe (retry next tick).
             any_failed = True
 
     if not args.dry_run:
