@@ -208,6 +208,43 @@ def yt_transcript_via_clipmaker(url):
     return data.get("segments") or [], data.get("title") or "video", None
 
 
+def podcast_transcript_via_clipmaker(url):
+    """Fetch podcast audio transcript by POSTing to ClipMaker's
+    /api/podcast-transcript on the user's Mac. ClipMaker downloads the audio
+    via yt-dlp and transcribes it with Groq's free Whisper endpoint. Returns
+    ({segments}, title, error)."""
+    base = os.environ.get("CLIPMAKER_URL", "").rstrip("/")
+    if not base:
+        return None, None, "CLIPMAKER_URL is not set"
+    token = os.environ.get("CLIPMAKER_AUTH_TOKEN") or ""
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    try:
+        # Longer timeout — Whisper on a 60-min podcast can take ~30-60 sec.
+        r = requests.post(f"{base}/api/podcast-transcript",
+                          headers=headers, json={"url": url}, timeout=900)
+    except requests.exceptions.RequestException as e:
+        return None, None, f"ClipMaker unreachable — is your Mac on and the tunnel running? ({type(e).__name__})"
+
+    if r.status_code == 401:
+        return None, None, "ClipMaker rejected the auth token"
+    if r.status_code == 429:
+        return None, None, "Groq rate limited (free-tier daily cap likely hit)"
+    if r.status_code >= 500:
+        try:
+            msg = r.json().get("error", r.text[:200])
+        except Exception:
+            msg = r.text[:200]
+        return None, None, f"ClipMaker error: {msg}"
+    if not r.ok:
+        return None, None, f"HTTP {r.status_code}: {r.text[:200]}"
+
+    data = r.json()
+    return data.get("segments") or [], data.get("title") or "podcast", None
+
+
 # ── Twitter/X ──────────────────────────────────────────────────────────────────
 
 def fetch_tweet(url):
@@ -641,8 +678,22 @@ def process_url(url, dry_run=False, slack=None, thread_ts=None):
         reply = build_article_reply(title, url, moments)
         is_summary = True
     elif pod_match:
-        print("  → podcast URL — not supported yet")
-        return None, False
+        print(f"  → Podcast {url}")
+        segments, pod_title, err = podcast_transcript_via_clipmaker(url)
+        if err and _is_transient(err):
+            raise TransientError(f"Podcast transcript unreachable: {err}")
+        if err or not segments:
+            print(f"  → podcast transcript unavailable (permanent): {err or 'no segments'}")
+            return None, False
+        title = pod_title or "podcast"
+        transcript_text = format_transcript_for_llm(segments)
+        print(f"  → {len(segments)} segments, ~{len(transcript_text)} chars")
+        moments = summarize(transcript_text, title)
+        print(f"  → {len(moments)} notable moments")
+        if not moments:
+            return None, False
+        reply = build_reply(title, moments)
+        is_summary = True
     else:
         return None, False
 
