@@ -173,6 +173,76 @@ def yt_title(video_id):
     return "video"
 
 
+def yt_transcript_via_ioapi(video_id):
+    """Cloud-native YouTube transcript via youtube-transcript.io API. Free tier
+    is 25/day, no residential IP required. Returns ({segments}, title, error).
+
+    Used as the primary YouTube path when YT_TRANSCRIPT_IO_TOKEN is set —
+    ClipMaker on the Mac is fallback (residential IP, no daily cap)."""
+    token = os.environ.get("YT_TRANSCRIPT_IO_TOKEN") or ""
+    if not token:
+        return None, None, "YT_TRANSCRIPT_IO_TOKEN is not set"
+
+    try:
+        r = requests.post(
+            "https://www.youtube-transcript.io/api/transcripts",
+            headers={
+                "Authorization": f"Basic {token}",
+                "Content-Type": "application/json",
+            },
+            json={"ids": [video_id]},
+            timeout=60,
+        )
+    except requests.exceptions.RequestException as e:
+        return None, None, f"youtube-transcript.io unreachable ({type(e).__name__})"
+
+    if r.status_code == 401:
+        return None, None, "youtube-transcript.io rejected the token"
+    if r.status_code == 429:
+        return None, None, "youtube-transcript.io daily quota hit (25/day free)"
+    if not r.ok:
+        return None, None, f"youtube-transcript.io HTTP {r.status_code}: {r.text[:200]}"
+
+    try:
+        data = r.json()
+    except ValueError:
+        return None, None, "youtube-transcript.io returned non-JSON"
+
+    if not isinstance(data, list) or not data:
+        return None, None, "youtube-transcript.io returned empty result"
+
+    item = data[0]
+    title = (item.get("title") or "video").strip()
+
+    # Pick the English track; fall back to first available track.
+    tracks = item.get("tracks") or []
+    if not tracks:
+        return None, None, "no transcript tracks available"
+    en_track = next(
+        (t for t in tracks if (t.get("language") or "").lower().startswith("english")),
+        tracks[0],
+    )
+    raw_segments = en_track.get("transcript") or []
+    if not raw_segments:
+        return None, None, "transcript track has no segments"
+
+    segments = []
+    for s in raw_segments:
+        text = (s.get("text") or "").strip()
+        if not text:
+            continue
+        try:
+            start = float(s.get("start", 0) or 0)
+            duration = float(s.get("dur", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        segments.append({"text": text, "start": start, "duration": duration})
+
+    if not segments:
+        return None, None, "no usable transcript segments"
+    return segments, title, None
+
+
 def yt_transcript_via_clipmaker(url):
     """Fetch YouTube transcript by POSTing to ClipMaker's /api/transcript on the
     user's Mac (exposed via a public tunnel). Bot lives in GH Actions cloud where
@@ -724,11 +794,17 @@ def process_url(url, dry_run=False, slack=None, thread_ts=None):
     if yt_match:
         video_id = yt_match.group(1)
         print(f"  → YouTube video {video_id}")
-        segments, cm_title, err = yt_transcript_via_clipmaker(url)
-        if err and _is_transient(err):
-            raise TransientError(f"YT transcript unreachable: {err}")
+        # Primary: cloud-native via youtube-transcript.io (free tier 25/day,
+        # no Mac needed). Fallback: ClipMaker on Mac (residential IP, no cap).
+        segments, cm_title, err = yt_transcript_via_ioapi(video_id)
+        if err:
+            print(f"  → ioapi failed: {err} — falling back to Mac")
+            segments, cm_title, err = yt_transcript_via_clipmaker(url)
+            if err and _is_transient(err):
+                raise TransientError(f"YT transcript unreachable (both paths): {err}")
         if err or not segments:
-            # Permanent-ish: no captions, video removed, etc. Skip silently.
+            # Both paths gave a permanent-ish failure — video may have no
+            # captions, be region-locked, or removed. Skip silently.
             print(f"  → no transcript (permanent): {err or 'no segments'}")
             return None, False
         title = cm_title if cm_title and cm_title != "video" else yt_title(video_id)

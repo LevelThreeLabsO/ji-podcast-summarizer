@@ -37,10 +37,12 @@ jobs:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          # Groq Whisper for podcast (and long-form YT fallback) transcription
+          # Groq Whisper for podcast transcription
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-          # Mac fallback for YouTube (residential IP) when the free
-          # youtube-transcript-io quota is exhausted or fails.
+          # Primary YouTube path: cloud-native transcript service (25/day free)
+          YT_TRANSCRIPT_IO_TOKEN: ${{ secrets.YT_TRANSCRIPT_IO_TOKEN }}
+          # Fallback for YouTube (residential IP) when the free quota is
+          # exhausted or the service fails.
           CLIPMAKER_URL: ${{ secrets.CLIPMAKER_URL }}
           CLIPMAKER_AUTH_TOKEN: ${{ secrets.CLIPMAKER_AUTH_TOKEN }}
       - name: Commit updated state
