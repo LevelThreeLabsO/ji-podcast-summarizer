@@ -38,7 +38,11 @@ TWEET_RE = re.compile(
 )
 # Generic http(s) URL — used as a fallback for news articles etc. Comes LAST
 # in dispatch so YT/Twitter/podcast URLs take priority.
+# Generic http(s) URL. We rstrip common trailing punctuation on the match
+# before use since Slack often includes a period/paren from the surrounding
+# sentence in the message text.
 ARTICLE_RE = re.compile(r"https?://[^\s>|<]+")
+_URL_TRAILING_JUNK = ".,!?;:)]\"'"
 
 SUMMARY_PROMPT = """You are analyzing a video transcript for a reporter at Jewish Insider, \
 a publication covering Jewish, Israel, and Middle East policy, politics, and community affairs. \
@@ -424,12 +428,22 @@ def fetch_tweet(url):
                     "dnt": "true"},
             timeout=15,
         )
-        if r.status_code == 404:
-            return None
-        r.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        # Network-level failure — TransientError so we retry next tick.
+        raise TransientError(f"tweet fetch network error: {type(e).__name__}")
+
+    # 404 = tweet deleted / protected / suspended (permanent).
+    if r.status_code == 404:
+        return None
+    # Transient upstream failures — 429 rate limit, 5xx — retry later.
+    if r.status_code == 429 or r.status_code >= 500:
+        raise TransientError(f"tweet fetch HTTP {r.status_code}")
+    if not r.ok:
+        print(f"  ! tweet fetch failed HTTP {r.status_code}", file=sys.stderr)
+        return None
+    try:
         data = r.json()
-    except Exception as e:
-        print(f"  ! tweet fetch failed: {type(e).__name__}: {e}", file=sys.stderr)
+    except ValueError:
         return None
 
     html_body = data.get("html", "")
@@ -533,7 +547,7 @@ def format_transcript_for_llm(segments):
 
 # ── Gemini summarizer ──────────────────────────────────────────────────────────
 
-def _gemini_generate_with_retry(prompt, max_tokens=4096):
+def _gemini_generate_with_retry(prompt, max_tokens=8192):
     """Call Gemini with retries + model fallback. Gemini's 'flash-latest' can
     hit 503 UNAVAILABLE (high demand). We retry with backoff, and if the fast
     model keeps failing, fall back to a lite variant."""
@@ -560,7 +574,12 @@ def _gemini_generate_with_retry(prompt, max_tokens=4096):
                 return client.models.generate_content(
                     model=model, contents=prompt, config=config,
                 )
-            except (gerrors.ServerError, gerrors.APIError) as e:
+            except gerrors.ClientError as e:
+                # 4xx from Gemini — safety filter, malformed prompt, context
+                # too long, wrong permission. Retrying won't help. Raise
+                # immediately so the caller can mark this URL permanently done.
+                raise
+            except gerrors.ServerError as e:
                 last_err = e
                 # Sleep 4s, 12s before the next attempt within the same model.
                 if attempt < 2:
@@ -652,9 +671,13 @@ def fetch_article(url):
             allow_redirects=True,
         )
     except requests.exceptions.RequestException as e:
-        print(f"  ! article fetch failed: {type(e).__name__}: {e}", file=sys.stderr)
-        return None
+        # Network-level failure (DNS, TLS, timeout, connection reset) — retry.
+        raise TransientError(f"article fetch network error: {type(e).__name__}")
 
+    # Transient upstream — retry.
+    if r.status_code == 429 or r.status_code >= 500:
+        raise TransientError(f"article fetch HTTP {r.status_code}")
+    # Permanent — 4xx that isn't rate-limit (403 paywall, 404 gone).
     if r.status_code >= 400:
         print(f"  ! article fetch HTTP {r.status_code}", file=sys.stderr)
         return None
@@ -734,16 +757,33 @@ def _esc(text):
 # ── State ──────────────────────────────────────────────────────────────────────
 
 def load_state():
-    if STATE_FILE.exists():
+    """Load watcher state, or return a fresh baseline. If the file EXISTS but
+    is corrupt, back it up and fail loudly — silently resetting to first-run
+    baseline would silently drop every URL from the last hour."""
+    if not STATE_FILE.exists():
+        return {"last_ts": None, "processed_ts": []}
+    try:
+        raw = STATE_FILE.read_text()
+        return json.loads(raw)
+    except Exception as e:
+        # Preserve the corrupt file for post-mortem, then bail hard so the
+        # workflow's Slack failure-alert fires.
         try:
-            return json.loads(STATE_FILE.read_text())
+            backup = STATE_FILE.with_suffix(".corrupt")
+            STATE_FILE.rename(backup)
+            print(f"  ! state file corrupt — moved to {backup}", file=sys.stderr)
         except Exception:
             pass
-    return {"last_ts": None, "processed_ts": []}
+        raise RuntimeError(f"watcher_state.json is corrupt: {type(e).__name__}: {e}")
 
 
 def save_state(state):
-    STATE_FILE.write_text(json.dumps(state, indent=2) + "\n")
+    """Atomic write: tempfile in same dir + os.replace so a mid-write kill
+    can't leave a half-written file that load_state would choke on."""
+    import os as _os
+    tmp = STATE_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(state, indent=2) + "\n")
+    _os.replace(tmp, STATE_FILE)
 
 
 # ── URL processing ─────────────────────────────────────────────────────────────
@@ -757,21 +797,31 @@ class TransientError(Exception):
     """
 
 
-# Substrings that indicate a ClipMaker-reachability failure vs a video-specific
-# issue. If any of these appear in the error string, treat as transient.
+# Substrings that indicate a failure that will likely resolve on its own —
+# retry next tick instead of marking the message permanently done. Permanent
+# failures (e.g. "no captions" from ClipMaker) return 200 with an empty
+# segments list now, so they don't route through this classifier.
 _TRANSIENT_HINTS = (
     "ClipMaker unreachable",
     "ClipMaker rejected the auth token",
     "CLIPMAKER_URL is not set",
-    "HTTP 5",             # any 5xx from the tunnel/ClipMaker
-    "ClipMaker error:",   # generic ClipMaker error passthrough
+    "HTTP 5",                          # any 5xx from tunnel/ClipMaker/upstream
+    "ClipMaker error:",                # ClipMaker returned a real 5xx (rare)
+    "rate limited",                    # Groq / ioapi / etc. rate-limit strings
+    "quota",                           # daily-cap / quota-exhausted messages
+    "unreachable",                     # generic unreachable phrasing
+    "Network",                         # requests.RequestException
+    "Timeout",
+    "Connection",
+    "HTTP 429",                        # explicit 429 anywhere in the chain
 )
 
 
 def _is_transient(err_str):
     if not err_str:
         return False
-    return any(h in err_str for h in _TRANSIENT_HINTS)
+    lower = err_str.lower()
+    return any(h.lower() in lower for h in _TRANSIENT_HINTS)
 
 
 def process_url(url, dry_run=False, slack=None, thread_ts=None):
@@ -963,7 +1013,7 @@ def main():
 
         # First supported URL per message — one summary per post.
         url_match = YOUTUBE_RE.search(text) or TWEET_RE.search(text) or PODCAST_RE.search(text) or ARTICLE_RE.search(text)
-        url = url_match.group(0)
+        url = url_match.group(0).rstrip(_URL_TRAILING_JUNK)
         print(f"[{ts}] processing: {url}")
         try:
             process_url(url, dry_run=args.dry_run, slack=slack, thread_ts=ts)
@@ -980,8 +1030,14 @@ def main():
             any_failed = True
         except Exception as e:
             print(f"  ! unexpected failure: {type(e).__name__}: {e}", file=sys.stderr)
-            # Unknown error — treat as transient to be safe (retry next tick).
-            any_failed = True
+            # Unknown deterministic error (Gemini 4xx, malformed JSON,
+            # AttributeError on unexpected LLM output, etc.). Retrying will
+            # produce the same failure and freeze the watermark. Mark as
+            # processed so we move on. The thread has no reply, matching the
+            # "silent skip on permanent failure" contract.
+            processed.add(ts)
+            if not any_failed:
+                advanceable_ts = max(advanceable_ts, ts_f)
 
     if not args.dry_run:
         state["last_ts"] = f"{advanceable_ts:.6f}"

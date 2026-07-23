@@ -18,9 +18,6 @@ concurrency:
 jobs:
   poll:
     runs-on: ubuntu-latest
-    # Cap the job so a hung poll.py can't block the self-chain. The Chain step
-    # still fires (if: always()) when timeout-minutes triggers.
-    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -32,6 +29,11 @@ jobs:
       - name: Install deps
         run: pip install -r requirements.txt
       - name: Poll and summarize
+        # Step-level timeout: kills only this step if a poll hangs. Commit,
+        # alert, and chain steps still run afterward so state gets persisted
+        # and the next tick is dispatched. 8 min gives a slow podcast enough
+        # room; anything past that is stuck and worth killing.
+        timeout-minutes: 8
         run: python3 poll.py
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
@@ -46,6 +48,10 @@ jobs:
           CLIPMAKER_URL: ${{ secrets.CLIPMAKER_URL }}
           CLIPMAKER_AUTH_TOKEN: ${{ secrets.CLIPMAKER_AUTH_TOKEN }}
       - name: Commit updated state
+        # if: always() — even if poll.py raised at the end, save_state() is
+        # atomic and may have committed useful work (messages processed
+        # earlier in the tick) before the exception. Persist what's there.
+        if: always()
         run: |
           git config user.name "podcast-summarizer-bot"
           git config user.email "bot@users.noreply.github.com"
@@ -77,15 +83,17 @@ jobs:
 
       - name: Chain next run
         # Replaces cron-job.org / Mac launchd pinger. Fires even on failure so
-        # the chain is self-healing. Sleep gives ~60s effective cadence.
-        # Failure to dispatch never fails the job — the schedule cron (*/10)
-        # recovers if the chain ever breaks.
+        # the chain is self-healing. Failure to dispatch never fails the job —
+        # the schedule cron (*/10) recovers if the chain ever breaks.
+        # NOTE: we curl FIRST, then sleep. The sleep spaces out chained runs
+        # to ~60-90s cadence; if the sleep is interrupted by a job cancel,
+        # the next run has already been queued.
         if: always()
+        timeout-minutes: 2
         env:
           CHAIN_PAT: ${{ secrets.SELF_DISPATCH_PAT }}
         run: |
           set +e
-          sleep 45
           curl -sS -X POST \
             -H "Accept: application/vnd.github+json" \
             -H "Authorization: Bearer $CHAIN_PAT" \
@@ -94,4 +102,5 @@ jobs:
             --max-time 30 \
             "https://api.github.com/repos/LevelThreeLabsO/ji-podcast-summarizer/actions/workflows/poll.yml/dispatches" \
             -d '{"ref":"main"}'
+          sleep 45
           exit 0
