@@ -24,6 +24,8 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
+      - name: Install ffmpeg (for podcast audio re-encoding)
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends ffmpeg
       - name: Install deps
         run: pip install -r requirements.txt
       - name: Poll and summarize
@@ -32,8 +34,10 @@ jobs:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          # YouTube transcripts route through ClipMaker running on the Mac
-          # (residential IP, bypasses YouTube's cloud-IP blocking).
+          # Groq Whisper for podcast (and long-form YT fallback) transcription
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          # Mac fallback for YouTube (residential IP) when the free
+          # youtube-transcript-io quota is exhausted or fails.
           CLIPMAKER_URL: ${{ secrets.CLIPMAKER_URL }}
           CLIPMAKER_AUTH_TOKEN: ${{ secrets.CLIPMAKER_AUTH_TOKEN }}
       - name: Commit updated state

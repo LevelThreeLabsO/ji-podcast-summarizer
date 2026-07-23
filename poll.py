@@ -208,6 +208,100 @@ def yt_transcript_via_clipmaker(url):
     return data.get("segments") or [], data.get("title") or "video", None
 
 
+def podcast_transcript_direct(url):
+    """Cloud-native podcast transcript: yt-dlp + ffmpeg + Groq Whisper — no Mac
+    needed. Apple Podcasts / Spotify serve audio publicly, so downloading works
+    from GH Actions cloud IPs. Returns ({segments}, title, error).
+    """
+    import glob
+    import subprocess
+    import tempfile
+
+    key = os.environ.get("GROQ_API_KEY") or ""
+    if not key:
+        return None, None, "GROQ_API_KEY is not set"
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        raw_out = os.path.join(tmpdir, "raw.%(ext)s")
+        proc = subprocess.run(
+            ["yt-dlp", "-x", "-o", raw_out, url],
+            capture_output=True, text=True, timeout=600,
+        )
+        if proc.returncode != 0:
+            err_lines = (proc.stderr or "").strip().splitlines()
+            return None, None, f"yt-dlp failed: {err_lines[-1] if err_lines else 'unknown'}"
+
+        raw_files = glob.glob(os.path.join(tmpdir, "raw.*"))
+        if not raw_files:
+            return None, None, "no audio file produced"
+        raw_audio = raw_files[0]
+
+        audio_path = os.path.join(tmpdir, "audio.opus")
+        proc = subprocess.run(
+            ["ffmpeg", "-y", "-i", raw_audio,
+             "-vn", "-ac", "1", "-ar", "16000",
+             "-c:a", "libopus", "-b:a", "16k",
+             "-application", "voip", "-vbr", "on",
+             audio_path],
+            capture_output=True, text=True, timeout=600,
+        )
+        if proc.returncode != 0:
+            err_lines = (proc.stderr or "").strip().splitlines()
+            return None, None, f"ffmpeg reencode failed: {err_lines[-1] if err_lines else 'unknown'}"
+
+        size_mb = os.path.getsize(audio_path) / (1024 * 1024)
+        if size_mb > 24:
+            return None, None, f"audio still too large after compression ({size_mb:.1f}MB)"
+
+        # Fetch title (best effort)
+        title = "podcast"
+        try:
+            tp = subprocess.run(
+                ["yt-dlp", "--skip-download", "--print", "title", url],
+                capture_output=True, text=True, timeout=30,
+            )
+            if tp.returncode == 0 and tp.stdout.strip():
+                title = tp.stdout.strip().splitlines()[0]
+        except Exception:
+            pass
+
+        try:
+            with open(audio_path, "rb") as f:
+                r = requests.post(
+                    "https://api.groq.com/openai/v1/audio/transcriptions",
+                    headers={"Authorization": f"Bearer {key}"},
+                    files={"file": (os.path.basename(audio_path), f, "audio/opus")},
+                    data={
+                        "model": "whisper-large-v3-turbo",
+                        "response_format": "verbose_json",
+                    },
+                    timeout=600,
+                )
+        except requests.exceptions.RequestException as e:
+            return None, None, f"Groq unreachable ({type(e).__name__})"
+
+        if r.status_code == 429:
+            return None, None, "Groq rate limited (free-tier daily cap)"
+        if not r.ok:
+            return None, None, f"Groq HTTP {r.status_code}: {r.text[:200]}"
+
+        try:
+            groq_data = r.json()
+        except ValueError:
+            return None, None, "Groq returned non-JSON"
+
+        segments = []
+        for seg in groq_data.get("segments", []) or []:
+            text = (seg.get("text") or "").strip()
+            if not text:
+                continue
+            start = float(seg.get("start", 0) or 0)
+            end = float(seg.get("end", start) or start)
+            segments.append({"text": text, "start": start, "duration": max(0.1, end - start)})
+
+    return segments, title, None
+
+
 def podcast_transcript_via_clipmaker(url):
     """Fetch podcast audio transcript by POSTing to ClipMaker's
     /api/podcast-transcript on the user's Mac. ClipMaker downloads the audio
@@ -679,9 +773,15 @@ def process_url(url, dry_run=False, slack=None, thread_ts=None):
         is_summary = True
     elif pod_match:
         print(f"  → Podcast {url}")
-        segments, pod_title, err = podcast_transcript_via_clipmaker(url)
-        if err and _is_transient(err):
-            raise TransientError(f"Podcast transcript unreachable: {err}")
+        # Try cloud-native first (no Mac needed). Fall back to ClipMaker on
+        # Mac if the direct path fails — usually because Groq is down or
+        # yt-dlp missing from the runner.
+        segments, pod_title, err = podcast_transcript_direct(url)
+        if err:
+            print(f"  → direct path failed: {err} — falling back to Mac")
+            segments, pod_title, err = podcast_transcript_via_clipmaker(url)
+            if err and _is_transient(err):
+                raise TransientError(f"Podcast transcript unreachable (both paths): {err}")
         if err or not segments:
             print(f"  → podcast transcript unavailable (permanent): {err or 'no segments'}")
             return None, False
