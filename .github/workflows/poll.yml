@@ -18,6 +18,9 @@ concurrency:
 jobs:
   poll:
     runs-on: ubuntu-latest
+    # Cap the job so a hung poll.py can't block the self-chain. The Chain step
+    # still fires (if: always()) when timeout-minutes triggers.
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -69,3 +72,24 @@ jobs:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+      - name: Chain next run
+        # Replaces cron-job.org / Mac launchd pinger. Fires even on failure so
+        # the chain is self-healing. Sleep gives ~60s effective cadence.
+        # Failure to dispatch never fails the job — the schedule cron (*/10)
+        # recovers if the chain ever breaks.
+        if: always()
+        env:
+          CHAIN_PAT: ${{ secrets.SELF_DISPATCH_PAT }}
+        run: |
+          set +e
+          sleep 45
+          curl -sS -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $CHAIN_PAT" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            --retry 5 --retry-all-errors --retry-delay 5 \
+            --max-time 30 \
+            "https://api.github.com/repos/LevelThreeLabsO/ji-podcast-summarizer/actions/workflows/poll.yml/dispatches" \
+            -d '{"ref":"main"}'
+          exit 0
