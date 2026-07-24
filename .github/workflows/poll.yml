@@ -20,13 +20,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        timeout-minutes: 2
       - uses: actions/setup-python@v5
+        timeout-minutes: 3
         with:
           python-version: "3.11"
           cache: pip
       - name: Install ffmpeg (for podcast audio re-encoding)
+        timeout-minutes: 3
         run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends ffmpeg
       - name: Install deps
+        timeout-minutes: 3
         run: pip install -r requirements.txt
       - name: Poll and summarize
         # Step-level timeout: kills only this step if a poll hangs. Commit,
