@@ -89,14 +89,12 @@ jobs:
       # in the GH Actions tab; the schedule cron and chain step self-heal.)
 
       - name: Chain next run
-        # Replaces cron-job.org / Mac launchd pinger. Fires even on failure so
-        # the chain is self-healing. Failure to dispatch never fails the job —
-        # the schedule cron (*/10) recovers if the chain ever breaks.
-        # NOTE: we curl FIRST, then sleep. The sleep spaces out chained runs
-        # to ~60-90s cadence; if the sleep is interrupted by a job cancel,
-        # the next run has already been queued.
+        # Fires even on failure so the chain is self-healing. Fail-fast on
+        # GH API 5xx (schedule cron */10 recovers). This step never fails
+        # the job — cadence, not hard requirement.
         if: always()
-        timeout-minutes: 2
+        timeout-minutes: 1
+        continue-on-error: true
         env:
           CHAIN_PAT: ${{ secrets.SELF_DISPATCH_PAT }}
         run: |
@@ -105,9 +103,9 @@ jobs:
             -H "Accept: application/vnd.github+json" \
             -H "Authorization: Bearer $CHAIN_PAT" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
-            --retry 5 --retry-all-errors --retry-delay 5 \
-            --max-time 30 \
+            --retry 2 --retry-delay 3 \
+            --max-time 10 \
             "https://api.github.com/repos/LevelThreeLabsO/ji-podcast-summarizer/actions/workflows/poll.yml/dispatches" \
-            -d '{"ref":"main"}'
+            -d '{"ref":"main"}' || echo "chain dispatch failed — schedule cron will recover"
           sleep 45
           exit 0
