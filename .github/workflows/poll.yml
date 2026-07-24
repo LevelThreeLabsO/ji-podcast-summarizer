@@ -27,8 +27,11 @@ jobs:
           python-version: "3.11"
           cache: pip
       - name: Install ffmpeg (for podcast audio re-encoding)
-        timeout-minutes: 3
-        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends ffmpeg
+        # Pre-built static binary — ~5 sec. `sudo apt-get install ffmpeg`
+        # pulls in 87 packages (~63MB) and Ubuntu's mirror was intermittently
+        # slow enough to blow past 3-min timeouts.
+        uses: FedericoCarboni/setup-ffmpeg@v3
+        timeout-minutes: 2
       - name: Install deps
         timeout-minutes: 3
         run: pip install -r requirements.txt
@@ -73,17 +76,9 @@ jobs:
             git pull --rebase -X ours --autostash origin main || git rebase --abort
           done
           echo "could not push state after 5 tries"; exit 1
-      - name: Alert Slack if the run failed
-        if: failure()
-        run: |
-          curl -sS -X POST https://slack.com/api/chat.postMessage \
-            -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
-            -H 'Content-Type: application/json; charset=utf-8' \
-            --data "{\"channel\":\"$SLACK_CHANNEL_ID\",\"text\":\":rotating_light: *YouTube summarizer run FAILED.* Check the log: $RUN_URL\"}" || true
-        env:
-          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
-          SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      # (Removed: "Alert Slack if the run failed" — was posting noise into
+      # #podcasts-plus-youtube on every transient hiccup. Failures are visible
+      # in the GH Actions tab; the schedule cron and chain step self-heal.)
 
       - name: Chain next run
         # Replaces cron-job.org / Mac launchd pinger. Fires even on failure so
