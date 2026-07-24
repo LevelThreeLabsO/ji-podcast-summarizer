@@ -27,11 +27,19 @@ jobs:
           python-version: "3.11"
           cache: pip
       - name: Install ffmpeg (for podcast audio re-encoding)
-        # Pre-built static binary — ~5 sec. `sudo apt-get install ffmpeg`
-        # pulls in 87 packages (~63MB) and Ubuntu's mirror was intermittently
-        # slow enough to blow past 3-min timeouts.
-        uses: FedericoCarboni/setup-ffmpeg@v3
+        # Direct download of a static binary — no apt, no wrapper action.
+        # Ubuntu's mirror was too slow for apt-get; the setup-ffmpeg action
+        # depends on a release-info endpoint that flakes. This just curls
+        # the tarball and drops the binary on PATH.
         timeout-minutes: 2
+        run: |
+          set -e
+          mkdir -p ~/bin
+          curl -sSL --retry 3 --max-time 60 \
+            https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz \
+            | tar -xJ --strip-components=1 -C ~/bin --wildcards '*/ffmpeg' '*/ffprobe'
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          ~/bin/ffmpeg -version | head -1
       - name: Install deps
         timeout-minutes: 3
         run: pip install -r requirements.txt
