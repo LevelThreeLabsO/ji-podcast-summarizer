@@ -995,6 +995,10 @@ def main():
                 advanceable_ts = max(advanceable_ts, ts_f)
             continue
         text = msg.get("text", "") or ""
+        # Slack encodes & / < / > in message text — decode so URL regexes match
+        # (e.g. `watch?app=desktop&amp;v=abc` needs to become `...&v=abc`).
+        from html import unescape as _unescape
+        text = _unescape(text)
         if not (YOUTUBE_RE.search(text) or TWEET_RE.search(text) or PODCAST_RE.search(text) or ARTICLE_RE.search(text)):
             if not any_failed:
                 advanceable_ts = max(advanceable_ts, ts_f)
