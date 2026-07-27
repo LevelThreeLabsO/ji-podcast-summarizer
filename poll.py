@@ -26,7 +26,12 @@ STATE_FILE = Path(__file__).resolve().parent / "watcher_state.json"
 
 YOUTUBE_RE = re.compile(
     r"https?://(?:www\.|m\.)?"
-    r"(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/live/|youtube\.com/shorts/)"
+    r"(?:"
+    #  watch?v=ID   OR   watch?anything&v=ID  (v isn't necessarily first)
+    r"youtube\.com/watch\?(?:[^\s]*?&)?v=|"
+    r"youtu\.be/|"
+    r"youtube\.com/(?:live|shorts|embed)/"
+    r")"
     r"([A-Za-z0-9_-]{11})"
 )
 PODCAST_RE = re.compile(
