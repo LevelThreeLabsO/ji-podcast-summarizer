@@ -65,7 +65,7 @@ Video: {title}
 TRANSCRIPT (with [MM:SS] timestamps):
 {transcript}
 
-Return a JSON array of 3-6 items. Each item:
+Return a JSON array of EXACTLY 5 items (aim for 5 even if you have to stretch to include a fifth notable point — surface the best 5 you can find). Each item:
 {{
   "headline": "news-headline-style one-liner packed with the specifics a JI editor would want at-a-glance",
   "start_min": <int minute>,
@@ -623,7 +623,7 @@ Article title: {title}
 ARTICLE TEXT:
 {text}
 
-Return a JSON array of 3-6 items. Each item:
+Return a JSON array of EXACTLY 5 items (aim for 5 even if you have to stretch to include a fifth notable point — surface the best 5 you can find). Each item:
 {{
   "headline": "news-headline-style one-liner packed with specifics a JI editor would want at-a-glance",
   "quote": "a direct verbatim pull-quote from the article, under 200 chars, or empty string if no clean one exists"
@@ -729,7 +729,8 @@ def build_article_reply(title, url, moments):
         quote = str(m.get("quote", "")).strip()
         if quote:
             lines.append(f"    • “{_esc(quote)}”")
-    return "\n".join(lines)
+        lines.append("")  # blank line between clips for readability
+    return "\n".join(lines).rstrip() + "\n".rstrip() + "\n"
 
 
 # ── Reply formatting ───────────────────────────────────────────────────────────
@@ -747,7 +748,8 @@ def build_reply(title, moments):
         quote = str(m.get("quote", "")).strip()
         if quote:
             lines.append(f"    • “{_esc(quote)}”")
-    return "\n".join(lines)
+        lines.append("")  # blank line between clips for readability
+    return "\n".join(lines).rstrip() + "\n"
 
 
 def _esc(text):
