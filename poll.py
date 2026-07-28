@@ -287,10 +287,98 @@ def yt_transcript_via_clipmaker(url):
     return data.get("segments") or [], data.get("title") or "video", None
 
 
+def resolve_spotify_to_mp3(spotify_url):
+    """Turn a Spotify episode URL into a public MP3 URL by resolving the
+    episode's show → iTunes Search → RSS feed → fuzzy-match the episode title.
+
+    Spotify audio is DRM-protected so yt-dlp can't touch it, but nearly every
+    podcast on Spotify also ships a public RSS feed with unprotected MP3
+    enclosures. Returns (mp3_url, show, episode_title, err).
+    """
+    import feedparser
+    from rapidfuzz import fuzz
+    from urllib.parse import quote_plus
+
+    m = re.search(r"episode/([A-Za-z0-9]+)", spotify_url)
+    if not m:
+        return None, None, None, "not a Spotify episode URL"
+    ep_id = m.group(1)
+
+    # 1. oembed → clean episode title
+    try:
+        oe = requests.get(
+            f"https://open.spotify.com/oembed?url=https://open.spotify.com/episode/{ep_id}",
+            timeout=15,
+        ).json()
+        ep_title = (oe.get("title") or "").strip()
+    except Exception as e:
+        return None, None, None, f"Spotify oembed failed: {type(e).__name__}"
+    if not ep_title:
+        return None, None, None, "Spotify oembed returned no title"
+
+    # 2. Scrape HTML → show name (JSON-LD partOfSeries.name, fallback og:description)
+    show = None
+    try:
+        html = requests.get(
+            f"https://open.spotify.com/episode/{ep_id}",
+            headers={"User-Agent": "Mozilla/5.0"}, timeout=15,
+        ).text
+        for blob in re.findall(r'<script type="application/ld\+json">(.+?)</script>', html, re.S):
+            try:
+                data = json.loads(blob)
+                candidate = (data.get("partOfSeries") or {}).get("name")
+                if candidate:
+                    show = candidate.strip()
+                    break
+            except Exception:
+                pass
+        if not show:
+            og = re.search(r'<meta property="og:description" content="([^"]+)"', html)
+            if og:
+                show = og.group(1).split("·")[0].strip()
+    except Exception:
+        pass
+    if not show:
+        return None, None, ep_title, "couldn't find show name on Spotify episode page"
+
+    # 3. iTunes Search → feedUrl
+    try:
+        it = requests.get(
+            f"https://itunes.apple.com/search?entity=podcast&limit=5&term={quote_plus(show)}",
+            timeout=15,
+        ).json()
+    except Exception as e:
+        return None, None, ep_title, f"iTunes lookup failed: {type(e).__name__}"
+    results = it.get("results") or []
+    if not results:
+        return None, show, ep_title, f"no public RSS feed for '{show}' (Spotify-exclusive?)"
+    feed_url = results[0].get("feedUrl")
+    if not feed_url:
+        return None, show, ep_title, "iTunes returned no feedUrl"
+
+    # 4. RSS → fuzzy-match episode title → MP3 enclosure
+    try:
+        feed = feedparser.parse(feed_url)
+    except Exception as e:
+        return None, show, ep_title, f"RSS parse failed: {type(e).__name__}"
+    if not feed.entries:
+        return None, show, ep_title, "RSS feed has no episodes"
+    best = max(feed.entries, key=lambda e: fuzz.token_set_ratio(ep_title, e.get("title", "")))
+    score = fuzz.token_set_ratio(ep_title, best.get("title", ""))
+    if score < 85:
+        return None, show, ep_title, f"no episode title match (best={score}: {best.get('title','')[:80]!r})"
+    encs = best.get("enclosures") or []
+    mp3_url = encs[0].get("href") if encs else None
+    if not mp3_url:
+        return None, show, ep_title, "matched episode has no MP3 enclosure"
+    return mp3_url, show, ep_title, None
+
+
 def podcast_transcript_direct(url):
     """Cloud-native podcast transcript: yt-dlp + ffmpeg + Groq Whisper — no Mac
-    needed. Apple Podcasts / Spotify serve audio publicly, so downloading works
-    from GH Actions cloud IPs. Returns ({segments}, title, error).
+    needed. Apple Podcasts serves audio publicly. Spotify uses DRM, so we
+    resolve Spotify episode URLs to their public RSS-feed MP3 first.
+    Returns ({segments}, title, error).
     """
     import glob
     import subprocess
@@ -300,10 +388,21 @@ def podcast_transcript_direct(url):
     if not key:
         return None, None, "GROQ_API_KEY is not set"
 
+    # Spotify: swap the DRM'd URL for the same episode's public RSS MP3.
+    resolved_title = None
+    fetch_url = url
+    if "open.spotify.com/episode" in url:
+        mp3_url, show, ep_title, err = resolve_spotify_to_mp3(url)
+        if err:
+            return None, None, f"Spotify resolve failed: {err}"
+        fetch_url = mp3_url
+        resolved_title = f"{show}: {ep_title}" if show else ep_title
+        print(f"  → Spotify resolved: {resolved_title}")
+
     with tempfile.TemporaryDirectory() as tmpdir:
         raw_out = os.path.join(tmpdir, "raw.%(ext)s")
         proc = subprocess.run(
-            ["yt-dlp", "-x", "-o", raw_out, url],
+            ["yt-dlp", "-x", "-o", raw_out, "--", fetch_url],
             capture_output=True, text=True, timeout=600,
         )
         if proc.returncode != 0:
@@ -332,17 +431,19 @@ def podcast_transcript_direct(url):
         if size_mb > 24:
             return None, None, f"audio still too large after compression ({size_mb:.1f}MB)"
 
-        # Fetch title (best effort)
-        title = "podcast"
-        try:
-            tp = subprocess.run(
-                ["yt-dlp", "--skip-download", "--print", "title", url],
-                capture_output=True, text=True, timeout=30,
-            )
-            if tp.returncode == 0 and tp.stdout.strip():
-                title = tp.stdout.strip().splitlines()[0]
-        except Exception:
-            pass
+        # Prefer the title we resolved from Spotify (has show + episode).
+        # Otherwise ask yt-dlp for the title of the raw audio URL.
+        title = resolved_title or "podcast"
+        if not resolved_title:
+            try:
+                tp = subprocess.run(
+                    ["yt-dlp", "--skip-download", "--print", "title", "--", url],
+                    capture_output=True, text=True, timeout=30,
+                )
+                if tp.returncode == 0 and tp.stdout.strip():
+                    title = tp.stdout.strip().splitlines()[0]
+            except Exception:
+                pass
 
         try:
             with open(audio_path, "rb") as f:
