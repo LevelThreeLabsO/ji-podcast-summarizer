@@ -9,8 +9,11 @@ on:
     - cron: "*/5 * * * *"
 
 # poll.py commits watcher_state.json back to the repo.
+# actions:write lets the self-chain step re-dispatch the workflow via the
+# built-in GITHUB_TOKEN — no PAT required.
 permissions:
   contents: write
+  actions: write
 
 # Serialize runs so we never storm the concurrency queue. cancel-in-progress:
 # false → if a run is executing, a new dispatch queues (max 1) rather than
@@ -89,7 +92,26 @@ jobs:
             git pull --rebase -X ours --autostash origin main || git rebase --abort
           done
           echo "could not push state after 5 tries"; exit 1
-      # Self-chain step removed 2026-08-06: it and cron-job.org together were
-      # dispatching every ~100s while Whisper-fallback runs take 3-5 min,
-      # overwhelming the concurrency queue and cancelling every run before
-      # it could execute. Cadence now comes from the */5 schedule cron only.
+      - name: Chain next run
+        # Fires one dispatch at the end of every run so cadence tracks run
+        # duration (sub-2-min in normal operation, 3-5 min when Whisper
+        # transcribes a caption-less video). Safe because the concurrency
+        # group serializes runs — extra external pings can't overflow the
+        # queue past the one queued slot. Uses the built-in GITHUB_TOKEN,
+        # so no PAT is required.
+        if: always()
+        timeout-minutes: 1
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set +e
+          curl -sS -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            --retry 2 --retry-delay 3 \
+            --max-time 10 \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/poll.yml/dispatches" \
+            -d '{"ref":"main"}' || echo "chain dispatch failed — schedule cron will recover"
+          exit 0
