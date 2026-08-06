@@ -15,13 +15,12 @@ permissions:
   contents: write
   actions: write
 
-# Serialize runs so we never storm the concurrency queue. cancel-in-progress:
-# false → if a run is executing, a new dispatch queues (max 1) rather than
-# starting in parallel. Because dispatches now only come from */5 cron + rare
-# manual triggers, the queue can't overflow.
-concurrency:
-  group: poll
-  cancel-in-progress: false
+# Concurrency intentionally omitted. Cron-job.org's external pinger is still
+# active (2026-08-06 storm root cause), and with any concurrency group new
+# dispatches evict older queued ones before they can wait for a runner —
+# nothing ever executes. Without a group, each dispatch just waits its turn.
+# Duplicate-safe: state save uses `git pull --rebase -X ours` and poll.py
+# guards on `processed_ts` + `Slack.thread_has_bot_reply`.
 
 jobs:
   poll:
