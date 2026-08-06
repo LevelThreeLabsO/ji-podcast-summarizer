@@ -25,6 +25,14 @@ permissions:
 jobs:
   poll:
     runs-on: ubuntu-latest
+    # Reject workflow_dispatches from sruli-hue (the "cron-job.org article
+    # watchers" PAT auths as that user). Keeps cron-job.org's pings from
+    # queueing pointless runs while leaving the token intact for the article
+    # watchers. Schedule cron and other actors (manual dispatch from the
+    # web UI, other PATs) still run normally.
+    if: >-
+      github.event_name != 'workflow_dispatch' ||
+      github.actor != 'sruli-hue'
     steps:
       - uses: actions/checkout@v4
         timeout-minutes: 2
