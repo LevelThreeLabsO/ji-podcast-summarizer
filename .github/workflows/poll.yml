@@ -11,9 +11,12 @@ on:
 permissions:
   contents: write
 
-concurrency:
-  group: poll
-  cancel-in-progress: false
+# NOTE: concurrency group removed 2026-08-06. cron-job.org pings ~every
+# 100s but a full poll can take 2-5 min. With a serialized concurrency queue,
+# incoming dispatches piled up and cancelled each other before executing,
+# stalling the bot for hours. Parallel runs are safe: state save uses
+# `git pull --rebase -X ours` so the watermark never rolls back, and
+# `processed_ts` + Slack.thread_has_bot_reply prevent duplicate summaries.
 
 jobs:
   poll:
