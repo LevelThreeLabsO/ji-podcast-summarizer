@@ -374,10 +374,89 @@ def resolve_spotify_to_mp3(spotify_url):
     return mp3_url, show, ep_title, None
 
 
+def resolve_apple_to_mp3(apple_url):
+    """Skip Apple's flaky /podcast/ page entirely. Extract podcast + episode
+    IDs from the URL, hit iTunes Search API twice (podcast → feedUrl; episode
+    → trackName), then fuzzy-match the RSS feed to the episode.
+
+    Apple Podcasts URLs look like:
+        https://podcasts.apple.com/us/podcast/<slug>/id<podcastId>?i=<trackId>
+
+    yt-dlp's ApplePodcasts extractor tries to scrape that page, which returns
+    HTTP 500 fairly often (seen 2026-08-10). Going through iTunes API + RSS
+    is more reliable and matches how Spotify is already handled.
+    Returns (mp3_url, show, episode_title, err).
+    """
+    import feedparser
+    from rapidfuzz import fuzz
+
+    pm = re.search(r"/id(\d+)", apple_url)
+    tm = re.search(r"[?&]i=(\d+)", apple_url)
+    if not pm:
+        return None, None, None, "couldn't parse podcast ID from Apple URL"
+    podcast_id = pm.group(1)
+    track_id = tm.group(1) if tm else None
+
+    # 1. iTunes lookup on podcast ID → feedUrl + show name
+    try:
+        r = requests.get(f"https://itunes.apple.com/lookup?id={podcast_id}", timeout=15).json()
+    except Exception as e:
+        return None, None, None, f"iTunes podcast lookup failed: {type(e).__name__}"
+    results = r.get("results") or []
+    if not results:
+        return None, None, None, f"iTunes has no podcast id={podcast_id}"
+    feed_url = results[0].get("feedUrl")
+    show = results[0].get("collectionName")
+    if not feed_url:
+        return None, show, None, "iTunes returned no feedUrl for podcast"
+
+    # 2. iTunes lookup on track ID → episode title (for fuzzy match).
+    # Uses entity=podcastEpisode which surfaces trackName = actual episode title.
+    ep_title = None
+    if track_id:
+        try:
+            ep_r = requests.get(
+                f"https://itunes.apple.com/lookup?id={track_id}&entity=podcastEpisode",
+                timeout=15,
+            ).json()
+            for e in ep_r.get("results", []):
+                if e.get("kind") == "podcast-episode" or e.get("wrapperType") == "podcastEpisode":
+                    ep_title = (e.get("trackName") or "").strip() or None
+                    if ep_title:
+                        break
+        except Exception:
+            pass
+
+    # 3. RSS → fuzzy-match episode title → MP3 enclosure
+    try:
+        feed = feedparser.parse(feed_url)
+    except Exception as e:
+        return None, show, ep_title, f"RSS parse failed: {type(e).__name__}"
+    if not feed.entries:
+        return None, show, ep_title, "RSS feed has no episodes"
+
+    if ep_title:
+        best = max(feed.entries, key=lambda e: fuzz.token_set_ratio(ep_title, e.get("title", "")))
+        score = fuzz.token_set_ratio(ep_title, best.get("title", ""))
+        if score < 85:
+            return None, show, ep_title, f"no RSS episode matched Apple title (best={score}: {best.get('title','')[:80]!r})"
+    else:
+        # No trackId in URL → fall back to newest RSS entry.
+        best = feed.entries[0]
+        ep_title = best.get("title", "")
+
+    encs = best.get("enclosures") or []
+    mp3_url = encs[0].get("href") if encs else None
+    if not mp3_url:
+        return None, show, ep_title, "matched episode has no MP3 enclosure"
+    return mp3_url, show, ep_title, None
+
+
 def podcast_transcript_direct(url):
     """Cloud-native podcast transcript: yt-dlp + ffmpeg + Groq Whisper — no Mac
-    needed. Apple Podcasts serves audio publicly. Spotify uses DRM, so we
-    resolve Spotify episode URLs to their public RSS-feed MP3 first.
+    needed. Spotify + Apple Podcasts URLs are resolved to their public RSS-feed
+    MP3 first (Spotify: DRM; Apple: flaky /podcast/ page). Direct MP3s pass
+    through unchanged.
     Returns ({segments}, title, error).
     """
     import glob
@@ -389,6 +468,7 @@ def podcast_transcript_direct(url):
         return None, None, "GROQ_API_KEY is not set"
 
     # Spotify: swap the DRM'd URL for the same episode's public RSS MP3.
+    # Apple: swap the flaky /podcast/ page for its RSS MP3 the same way.
     resolved_title = None
     fetch_url = url
     if "open.spotify.com/episode" in url:
@@ -398,6 +478,13 @@ def podcast_transcript_direct(url):
         fetch_url = mp3_url
         resolved_title = f"{show}: {ep_title}" if show else ep_title
         print(f"  → Spotify resolved: {resolved_title}")
+    elif "podcasts.apple.com" in url:
+        mp3_url, show, ep_title, err = resolve_apple_to_mp3(url)
+        if err:
+            return None, None, f"Apple resolve failed: {err}"
+        fetch_url = mp3_url
+        resolved_title = f"{show}: {ep_title}" if show else ep_title
+        print(f"  → Apple resolved: {resolved_title}")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         raw_out = os.path.join(tmpdir, "raw.%(ext)s")
