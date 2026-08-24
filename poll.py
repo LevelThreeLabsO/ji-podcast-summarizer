@@ -1068,15 +1068,37 @@ def process_url(url, dry_run=False, slack=None, thread_ts=None):
         if not tweet:
             print("  → tweet fetch failed — deleted/protected/suspended (permanent)")
             return None, False
+        # Video-only tweets: transcribe the video (yt-dlp handles X.com URLs)
+        # and summarize like a podcast/YouTube video into 5 Notable Moments.
         if tweet["has_video"] and len(tweet["text"]) < 40:
-            print("  → video-only tweet (permanent skip until v2)")
-            return None, False
-        verdict = summarize_tweet(tweet)
-        print(f"  → news_making={verdict.get('news_making')}")
-        if not verdict.get("news_making"):
-            return None, False
-        reply = build_tweet_reply(tweet, verdict)
-        is_summary = True
+            print("  → video-only tweet — transcribing")
+            segments, _t, err = podcast_transcript_direct(url)
+            if err:
+                if _is_transient(err):
+                    raise TransientError(f"tweet video transient: {err}")
+                print(f"  → tweet video transcript failed (permanent): {err}")
+                return None, False
+            if not segments:
+                print("  → tweet video: no segments")
+                return None, False
+            handle = tweet["author_handle"] or "unknown"
+            author = tweet["author_name"] or handle
+            title = f"{author} (@{handle}) video tweet"
+            transcript_text = format_transcript_for_llm(segments)
+            print(f"  → {len(segments)} segments, ~{len(transcript_text)} chars")
+            moments = summarize(transcript_text, title)
+            print(f"  → {len(moments)} notable moments")
+            if not moments:
+                return None, False
+            reply = build_reply(title, moments)
+            is_summary = True
+        else:
+            verdict = summarize_tweet(tweet)
+            print(f"  → news_making={verdict.get('news_making')}")
+            if not verdict.get("news_making"):
+                return None, False
+            reply = build_tweet_reply(tweet, verdict)
+            is_summary = True
     elif article_match:
         print(f"  → Article {url}")
         article = fetch_article(url)
