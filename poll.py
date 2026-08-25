@@ -760,6 +760,11 @@ def _gemini_generate_with_retry(prompt, max_tokens=8192):
         max_output_tokens=max_tokens,
     )
 
+    # httpx network errors bubble up from google-genai's HTTP client (e.g.
+    # RemoteProtocolError when Google's server drops the connection mid-response).
+    # These are transient and worth retrying — same treatment as ServerError.
+    import httpx
+
     last_err = None
     for model in models:
         for attempt in range(3):
@@ -772,7 +777,9 @@ def _gemini_generate_with_retry(prompt, max_tokens=8192):
                 # too long, wrong permission. Retrying won't help. Raise
                 # immediately so the caller can mark this URL permanently done.
                 raise
-            except gerrors.ServerError as e:
+            except (gerrors.ServerError, httpx.RemoteProtocolError,
+                    httpx.ReadTimeout, httpx.ConnectError,
+                    httpx.ConnectTimeout, httpx.RemoteProtocolError) as e:
                 last_err = e
                 # Sleep 4s, 12s before the next attempt within the same model.
                 if attempt < 2:
@@ -780,7 +787,10 @@ def _gemini_generate_with_retry(prompt, max_tokens=8192):
                     continue
                 # Otherwise fall through to the next model.
                 break
-    # If we're here, everything failed.
+    # If we're here, everything failed — surface as TransientError so the
+    # caller retries next tick instead of marking permanently done.
+    if last_err and not isinstance(last_err, gerrors.ClientError):
+        raise TransientError(f"Gemini transient after retries: {type(last_err).__name__}: {last_err}")
     raise last_err if last_err else RuntimeError("Gemini call failed for unknown reason")
 
 
