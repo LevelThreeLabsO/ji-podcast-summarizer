@@ -182,6 +182,48 @@ def yt_title(video_id):
     return "video"
 
 
+# YouTube names machine-translated caption tracks "<Target> from <Source>",
+# e.g. "Arabic from English (United States)". Quoting from one of those yields
+# a pull-quote the speaker never actually said — an editorial problem, not just
+# a cosmetic one. Matched case-insensitively against the track's language name.
+_TRANSLATED_TRACK_RE = re.compile(r"\bfrom\s+[A-Z]", re.IGNORECASE)
+
+
+def _pick_original_track(tracks):
+    """Choose a caption track that reflects what was actually spoken.
+
+    Returns (track, None) or (None, error). Never returns a machine
+    translation: on 2026-09-08 the bot quoted Avril Haines and Walter Russell
+    Mead in Arabic because the old code fell back to `tracks[0]` whenever no
+    track's name began with "english", and on those videos every track was an
+    auto-translation.
+
+    Deliberately NOT "prefer English" — a Hebrew Netanyahu speech should be
+    summarized from its Hebrew original, and that already works. The rule is
+    original-vs-translated, not English-vs-everything.
+    """
+    def name_of(t):
+        return (t.get("language") or t.get("languageCode") or "").strip()
+
+    originals = [t for t in tracks if not _TRANSLATED_TRACK_RE.search(name_of(t))]
+    if not originals:
+        names = ", ".join(name_of(t) for t in tracks[:4])
+        return None, (f"only machine-translated caption tracks available "
+                      f"({names}…) — refusing to quote a translation")
+
+    # Among genuine tracks, prefer one explicitly flagged original, then
+    # English, then whatever is left (covers Hebrew/Arabic-original videos).
+    def rank(t):
+        n = name_of(t).lower()
+        if "orig" in n:
+            return 0
+        if n.startswith("english") or n in ("en", "en-us", "en-gb"):
+            return 1
+        return 2
+
+    return sorted(originals, key=rank)[0], None
+
+
 def yt_transcript_via_ioapi(video_id):
     """Cloud-native YouTube transcript via youtube-transcript.io API. Free tier
     is 25/day, no residential IP required. Returns ({segments}, title, error).
@@ -223,14 +265,12 @@ def yt_transcript_via_ioapi(video_id):
     item = data[0]
     title = (item.get("title") or "video").strip()
 
-    # Pick the English track; fall back to first available track.
     tracks = item.get("tracks") or []
     if not tracks:
         return None, None, "no transcript tracks available"
-    en_track = next(
-        (t for t in tracks if (t.get("language") or "").lower().startswith("english")),
-        tracks[0],
-    )
+    en_track, pick_err = _pick_original_track(tracks)
+    if en_track is None:
+        return None, None, pick_err
     raw_segments = en_track.get("transcript") or []
     if not raw_segments:
         return None, None, "transcript track has no segments"
