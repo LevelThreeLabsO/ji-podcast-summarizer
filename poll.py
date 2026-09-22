@@ -870,9 +870,13 @@ def _gemini_generate_with_retry(prompt, max_tokens=8192):
                 # long, wrong permission — is genuinely permanent. Retrying or
                 # switching models sends the same bad request.
                 raise
-            except (gerrors.ServerError, httpx.RemoteProtocolError,
-                    httpx.ReadTimeout, httpx.ConnectError,
-                    httpx.ConnectTimeout) as e:
+            except (gerrors.ServerError, httpx.TransportError) as e:
+                # httpx.TransportError is the BASE class for every network-level
+                # failure: ConnectError, ConnectTimeout, ReadError, ReadTimeout,
+                # WriteError, PoolTimeout, RemoteProtocolError, ProxyError.
+                # Naming them individually left gaps — httpx.ReadError ("connection
+                # reset by peer") escaped an earlier four-name list and crashed the
+                # run. All of these are worth retrying; none is a bad request.
                 last_err = e
                 # Sleep 4s, 12s before the next attempt within the same model.
                 if attempt < 2:
