@@ -1297,6 +1297,22 @@ def main():
     print(f"  → {len(messages)} messages in window")
 
     processed = set(state.get("processed_ts", []))
+
+    # Per-message retry backoff. Runs tick every ~30s, so without this a link
+    # that keeps failing re-calls the metered APIs (Gemini, youtube-transcript)
+    # twice a minute forever. On 2026-09-22 three stuck links drained a fresh
+    # 20/day Gemini key inside minutes and blocked their own recovery — the
+    # retry was burning the quota it was waiting on.
+    #
+    # retry_after maps message ts -> unix time before which we skip it, and
+    # retry_count -> how many transient failures it has had. Backoff is
+    # 2m, 5m, 15m, 45m, then hourly. A transcript or quota outage now costs a
+    # handful of calls an hour instead of ~120.
+    retry_after = dict(state.get("retry_after", {}))
+    retry_count = dict(state.get("retry_count", {}))
+    _BACKOFF = [120, 300, 900, 2700, 3600]
+    now_ts = time.time()
+
     # Track the newest ts we can safely advance the polling window past.
     # We only advance past a message if it's been fully handled (processed,
     # baseline-skipped, or contains no URL we care about). If a message
@@ -1312,6 +1328,15 @@ def main():
         if ts in processed:
             if not any_failed:
                 advanceable_ts = max(advanceable_ts, ts_f)
+            continue
+        # Still cooling off from a previous transient failure. Skip without
+        # touching any metered API, and hold the watermark so it stays in the
+        # window for the next attempt.
+        if now_ts < retry_after.get(ts, 0):
+            wait = int(retry_after[ts] - now_ts)
+            print(f"  ⏸ {ts} backing off {wait}s "
+                  f"(attempt {retry_count.get(ts, 0)}) — skipping this tick")
+            any_failed = True
             continue
         # Skip messages from the bot itself + other bots.
         if msg.get("user") == bot_user_id or msg.get("bot_id"):
@@ -1358,7 +1383,12 @@ def main():
             if not any_failed:
                 advanceable_ts = max(advanceable_ts, ts_f)
         except TransientError as e:
-            print(f"  ! transient — will retry next tick: {e}", file=sys.stderr)
+            n = retry_count.get(ts, 0)
+            delay = _BACKOFF[min(n, len(_BACKOFF) - 1)]
+            retry_count[ts] = n + 1
+            retry_after[ts] = now_ts + delay
+            print(f"  ! transient — retry in {delay}s (attempt {n + 1}): {e}",
+                  file=sys.stderr)
             # Silent: no reply posted, ts not marked. Next tick fetches this
             # message again and tries again. When your Mac / tunnel / Gemini
             # comes back, the summary posts as if nothing happened.
@@ -1377,6 +1407,13 @@ def main():
     if not args.dry_run:
         state["last_ts"] = f"{advanceable_ts:.6f}"
         state["processed_ts"] = sorted(processed)[-500:]  # cap size
+        # Drop backoff bookkeeping for anything now finished, and for anything
+        # that has fallen out of the polling window, so these can't grow forever.
+        for d in (retry_after, retry_count):
+            for k in [k for k in d if k in processed or float(k) < advanceable_ts]:
+                d.pop(k, None)
+        state["retry_after"] = retry_after
+        state["retry_count"] = retry_count
         save_state(state)
 
 
