@@ -320,8 +320,23 @@ def yt_transcript_via_clipmaker(url):
         except Exception:
             msg = r.text[:200]
         return None, None, f"ClipMaker error: {msg}"
+    if r.status_code == 400:
+        # ClipMaker itself rejecting the request (bad/unsupported URL).
+        # Genuinely permanent — retrying sends the same bad URL.
+        return None, None, f"ClipMaker rejected the request: {r.text[:200]}"
     if not r.ok:
-        return None, None, f"HTTP {r.status_code}: {r.text[:200]}"
+        # Any other non-OK status came from the tunnel edge, not ClipMaker:
+        # /api/transcript only ever answers 200/400/401/5xx, and never 405 to
+        # a POST. Cloudflare returns its own 405 (and 403/404/52x) when the
+        # tunnel is registered but no origin is serving — i.e. the Mac or
+        # Flask is down. On 2026-09-21 that 405 was classified permanent and
+        # three links were dropped silently, 40 seconds after the same outage
+        # had correctly produced a retryable ConnectionError. Phrasing
+        # deliberately starts with "ClipMaker unreachable" so _TRANSIENT_HINTS
+        # matches and the link is retried instead of discarded.
+        return None, None, (f"ClipMaker unreachable — tunnel answered HTTP "
+                            f"{r.status_code} but ClipMaker did not "
+                            f"(Mac or Flask down)")
 
     data = r.json()
     return data.get("segments") or [], data.get("title") or "video", None
