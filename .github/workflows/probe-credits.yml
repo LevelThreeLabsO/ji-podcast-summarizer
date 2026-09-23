@@ -15,79 +15,55 @@ jobs:
           probe() {
             local label="$1"; shift
             echo ""
-            echo "=============================================="
-            echo "PROBE: $label"
-            echo "=============================================="
+            echo "########## PROBE: $label"
             code=$(curl -s -o /tmp/body -D /tmp/hdr -w '%{http_code}' "$@" || echo "CURL_ERR")
-            echo "--- STATUS: $code"
-            echo "--- HEADERS:"
-            sed "s|${TOKEN}|[REDACTED]|g" /tmp/hdr | sed 's/\r$//'
-            echo "--- BODY:"
-            sed "s|${TOKEN}|[REDACTED]|g" /tmp/body
+            echo "STATUS: $code"
+            echo "HEADERS:"
+            sed "s|${TOKEN}|[REDACTED]|g" /tmp/hdr | sed 's/\r$//' | grep -vi "^report-to\|^nel:\|^alt-svc\|^strict-trans\|^cache-control\|^vary:" | head -25
+            echo "BODY (first 300 bytes):"
+            sed "s|${TOKEN}|[REDACTED]|g" /tmp/body | head -c 300
             echo ""
-            echo "--- (end body)"
+            echo "BODYLEN: $(wc -c < /tmp/body) bytes"
           }
 
-          echo "Token length: ${#TOKEN} chars"
+          U=https://www.youtube-transcript.io/api/transcripts
+          AUTH="Authorization: Basic ${TOKEN}"
+          CT="Content-Type: application/json"
 
-          probe "A) POST /api/transcripts WITH token" \
-            -X POST https://www.youtube-transcript.io/api/transcripts \
-            -H "Authorization: Basic ${TOKEN}" \
-            -H "Content-Type: application/json" \
-            -d '{"ids":["dQw4w9WgXcQ"]}'
+          # 1. The EXACT video that returned 402 in production at 17:11:07 UTC today
+          probe "1) bTJggsMK6uQ (the video that 402'd in prod today)" \
+            -X POST $U -H "$AUTH" -H "$CT" -d '{"ids":["bTJggsMK6uQ"]}'
 
-          probe "A2) POST /api/transcripts NO auth header (control)" \
-            -X POST https://www.youtube-transcript.io/api/transcripts \
-            -H "Content-Type: application/json" \
-            -d '{"ids":["dQw4w9WgXcQ"]}'
+          # 2. Rick Astley - the one that returned 200 in probe #1
+          probe "2) dQw4w9WgXcQ (returned 200 ten minutes after prod got 402)" \
+            -X POST $U -H "$AUTH" -H "$CT" -d '{"ids":["dQw4w9WgXcQ"]}'
 
-          probe "A3) POST /api/transcripts BOGUS token (control)" \
-            -X POST https://www.youtube-transcript.io/api/transcripts \
-            -H "Authorization: Basic deadbeefdeadbeefdeadbeef" \
-            -H "Content-Type: application/json" \
-            -d '{"ids":["dQw4w9WgXcQ"]}'
+          # 3. Repeat the same famous video - if credits gate each call, a zero
+          #    balance could not serve it twice.
+          probe "3) dQw4w9WgXcQ AGAIN (repeat-call test)" \
+            -X POST $U -H "$AUTH" -H "$CT" -d '{"ids":["dQw4w9WgXcQ"]}'
 
-          probe "A4) POST /api/transcripts EMPTY ids (does it still charge?)" \
-            -X POST https://www.youtube-transcript.io/api/transcripts \
-            -H "Authorization: Basic ${TOKEN}" \
-            -H "Content-Type: application/json" \
-            -d '{"ids":[]}'
+          # 4. Another extremely famous / certainly-cached video
+          probe "4) jNQXAC9IVRw (Me at the zoo - first YouTube video ever)" \
+            -X POST $U -H "$AUTH" -H "$CT" -d '{"ids":["jNQXAC9IVRw"]}'
 
-          probe "B) GET /api/account" \
-            https://www.youtube-transcript.io/api/account \
-            -H "Authorization: Basic ${TOKEN}"
+          # 5. Both together in one request - does it return partial results?
+          probe "5) BOTH ids in one request" \
+            -X POST $U -H "$AUTH" -H "$CT" -d '{"ids":["dQw4w9WgXcQ","bTJggsMK6uQ"]}'
 
-          probe "C) GET /api/credits" \
-            https://www.youtube-transcript.io/api/credits \
-            -H "Authorization: Basic ${TOKEN}"
+          # 6. The v2 route the site advertises in window.pRoutes
+          probe "6) /api/transcripts/v2 with bTJggsMK6uQ" \
+            -X POST https://www.youtube-transcript.io/api/transcripts/v2 \
+            -H "$AUTH" -H "$CT" -d '{"ids":["bTJggsMK6uQ"]}'
 
-          probe "D) GET /api/usage" \
-            https://www.youtube-transcript.io/api/usage \
-            -H "Authorization: Basic ${TOKEN}"
+          # 7. v2 with the cached video
+          probe "7) /api/transcripts/v2 with dQw4w9WgXcQ" \
+            -X POST https://www.youtube-transcript.io/api/transcripts/v2 \
+            -H "$AUTH" -H "$CT" -d '{"ids":["dQw4w9WgXcQ"]}'
 
-          probe "E) GET /api/me" \
-            https://www.youtube-transcript.io/api/me \
-            -H "Authorization: Basic ${TOKEN}"
-
-          probe "F) GET /api/user" \
-            https://www.youtube-transcript.io/api/user \
-            -H "Authorization: Basic ${TOKEN}"
-
-          probe "G) GET /api/subscription" \
-            https://www.youtube-transcript.io/api/subscription \
-            -H "Authorization: Basic ${TOKEN}"
-
-          probe "H) GET /api/transcripts (wrong method probe)" \
-            https://www.youtube-transcript.io/api/transcripts \
-            -H "Authorization: Basic ${TOKEN}"
-
-          probe "I) GET /api/balance" \
-            https://www.youtube-transcript.io/api/balance \
-            -H "Authorization: Basic ${TOKEN}"
-
-          probe "J) GET /api (root)" \
-            https://www.youtube-transcript.io/api \
-            -H "Authorization: Basic ${TOKEN}"
+          # 8. bTJggsMK6uQ once more - is the 402 stable for this id?
+          probe "8) bTJggsMK6uQ again (is the 402 stable per-video?)" \
+            -X POST $U -H "$AUTH" -H "$CT" -d '{"ids":["bTJggsMK6uQ"]}'
 
           echo ""
           echo "PROBE COMPLETE"
