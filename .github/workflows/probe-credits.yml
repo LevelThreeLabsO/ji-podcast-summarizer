@@ -1,0 +1,93 @@
+name: Probe youtube-transcript.io credits
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Probe API
+        env:
+          TOKEN: ${{ secrets.YT_TRANSCRIPT_IO_TOKEN }}
+        run: |
+          set +x
+          probe() {
+            local label="$1"; shift
+            echo ""
+            echo "=============================================="
+            echo "PROBE: $label"
+            echo "=============================================="
+            code=$(curl -s -o /tmp/body -D /tmp/hdr -w '%{http_code}' "$@" || echo "CURL_ERR")
+            echo "--- STATUS: $code"
+            echo "--- HEADERS:"
+            sed "s|${TOKEN}|[REDACTED]|g" /tmp/hdr | sed 's/\r$//'
+            echo "--- BODY:"
+            sed "s|${TOKEN}|[REDACTED]|g" /tmp/body
+            echo ""
+            echo "--- (end body)"
+          }
+
+          echo "Token length: ${#TOKEN} chars"
+
+          probe "A) POST /api/transcripts WITH token" \
+            -X POST https://www.youtube-transcript.io/api/transcripts \
+            -H "Authorization: Basic ${TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d '{"ids":["dQw4w9WgXcQ"]}'
+
+          probe "A2) POST /api/transcripts NO auth header (control)" \
+            -X POST https://www.youtube-transcript.io/api/transcripts \
+            -H "Content-Type: application/json" \
+            -d '{"ids":["dQw4w9WgXcQ"]}'
+
+          probe "A3) POST /api/transcripts BOGUS token (control)" \
+            -X POST https://www.youtube-transcript.io/api/transcripts \
+            -H "Authorization: Basic deadbeefdeadbeefdeadbeef" \
+            -H "Content-Type: application/json" \
+            -d '{"ids":["dQw4w9WgXcQ"]}'
+
+          probe "A4) POST /api/transcripts EMPTY ids (does it still charge?)" \
+            -X POST https://www.youtube-transcript.io/api/transcripts \
+            -H "Authorization: Basic ${TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d '{"ids":[]}'
+
+          probe "B) GET /api/account" \
+            https://www.youtube-transcript.io/api/account \
+            -H "Authorization: Basic ${TOKEN}"
+
+          probe "C) GET /api/credits" \
+            https://www.youtube-transcript.io/api/credits \
+            -H "Authorization: Basic ${TOKEN}"
+
+          probe "D) GET /api/usage" \
+            https://www.youtube-transcript.io/api/usage \
+            -H "Authorization: Basic ${TOKEN}"
+
+          probe "E) GET /api/me" \
+            https://www.youtube-transcript.io/api/me \
+            -H "Authorization: Basic ${TOKEN}"
+
+          probe "F) GET /api/user" \
+            https://www.youtube-transcript.io/api/user \
+            -H "Authorization: Basic ${TOKEN}"
+
+          probe "G) GET /api/subscription" \
+            https://www.youtube-transcript.io/api/subscription \
+            -H "Authorization: Basic ${TOKEN}"
+
+          probe "H) GET /api/transcripts (wrong method probe)" \
+            https://www.youtube-transcript.io/api/transcripts \
+            -H "Authorization: Basic ${TOKEN}"
+
+          probe "I) GET /api/balance" \
+            https://www.youtube-transcript.io/api/balance \
+            -H "Authorization: Basic ${TOKEN}"
+
+          probe "J) GET /api (root)" \
+            https://www.youtube-transcript.io/api \
+            -H "Authorization: Basic ${TOKEN}"
+
+          echo ""
+          echo "PROBE COMPLETE"
