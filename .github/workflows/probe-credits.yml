@@ -1,0 +1,50 @@
+name: Probe youtube-transcript.io credits
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Probe API
+        env:
+          TOKEN: ${{ secrets.YT_TRANSCRIPT_IO_TOKEN }}
+        run: |
+          set +x
+          U=https://www.youtube-transcript.io/api/transcripts
+
+          check() {
+            vid="$1"; note="$2"
+            code=$(curl -s -o /tmp/body -w '%{http_code}' \
+              -X POST $U \
+              -H "Authorization: Basic ${TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d "{\"ids\":[\"$vid\"]}")
+            len=$(wc -c < /tmp/body)
+            body=""
+            if [ "$code" != "200" ]; then
+              body=" | $(sed "s|${TOKEN}|[REDACTED]|g" /tmp/body | head -c 80)"
+            fi
+            printf '%-14s %-6s %-9s %s%s\n' "$vid" "$code" "${len}B" "$note" "$body"
+          }
+
+          echo "VIDEO          STATUS BYTES     PRIOR PRODUCTION RESULT"
+          echo "-------------------------------------------------------------"
+          echo "--- Group A: ioapi SUCCEEDED in production (no 'ioapi failed' line) ---"
+          check EHKXlTX9fjw "Sept 14 18:50 SUCCESS"
+          check DuxjjowDFz0 "Sept 14 18:57 SUCCESS"
+          check PUcooQRy0PU "Sept 16 08:59 SUCCESS"
+          check HFOhG1jH2tk "Sept 18 14:32 SUCCESS"
+
+          echo "--- Group B: ioapi returned 402 in production ---"
+          check YtO3XQVi4lM "Sept 17 12:24 402"
+          check vWP2bFt-jz8 "Sept 18 11:13 402"
+          check iixtaiov_nI "Sept 21 21:46 402"
+          check 5mrCEbg9tAs "Sept 21 21:46 402"
+          check 2c7EmoMPlFs "Sept 21 21:46 402"
+          check 2BeMOJ6EhDw "Sept 22 16:19 402"
+          check 77y4dn5Dgvs "Sept 22 17:53 402"
+          check bTJggsMK6uQ "Sept 23 17:11 402"
+
+          echo "PROBE COMPLETE"
