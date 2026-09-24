@@ -1,0 +1,170 @@
+#!/usr/bin/env bash
+# TEMPORARY probe: does YouTube block yt-dlp from GitHub Actions datacenter IPs?
+# Delete after the run.
+set +e
+
+echo "=============================================="
+echo "SECTION 0: ENVIRONMENT"
+echo "=============================================="
+echo "--- runner public IP / ASN ---"
+curl -s --max-time 20 https://ipinfo.io/json | head -20
+echo
+echo "--- preinstalled yt-dlp ---"
+which yt-dlp && yt-dlp --version
+echo "--- ffmpeg ---"
+which ffmpeg && ffmpeg -version 2>/dev/null | head -1
+echo
+echo "--- upgrading yt-dlp to latest ---"
+python -m pip install -q -U yt-dlp 2>&1 | tail -3
+echo -n "yt-dlp version after upgrade: "
+python -m yt_dlp --version
+
+YTDLP="python -m yt_dlp"
+
+cat > /tmp/parse_json3.py <<'PYEOF'
+import json, sys
+d = json.load(open(sys.argv[1]))
+ev = d.get("events", [])
+n = 0
+first = ""
+for e in ev:
+    t = "".join(s.get("utf8", "") for s in (e.get("segs") or [])).strip()
+    if t:
+        n += 1
+        if not first:
+            first = t
+print("   parsed_segments=%d first_segment=%r" % (n, first[:80]))
+PYEOF
+
+run_caption_test () {
+  LABEL="$1"; VID="$2"; shift 2
+  DIR=$(mktemp -d)
+  echo
+  echo "======================================================"
+  echo "TEST: $LABEL  (video=$VID)"
+  echo "extra args: $*"
+  echo "------------------------------------------------------"
+  START=$(date +%s)
+  $YTDLP --skip-download --write-subs --write-auto-subs \
+    --sub-langs "en,en-orig,en-US,en-GB" --sub-format json3 \
+    --no-progress --socket-timeout 30 \
+    "$@" -o "$DIR/%(id)s" -- "https://www.youtube.com/watch?v=$VID" 2>&1 | tail -25
+  RC=${PIPESTATUS[0]}
+  END=$(date +%s)
+  echo "--- exit code: $RC   elapsed: $((END-START))s ---"
+  echo "--- files produced ---"
+  ls -la "$DIR" 2>/dev/null | tail -10
+  FOUND=$(ls "$DIR"/*.json3 2>/dev/null | head -1)
+  if [ -n "$FOUND" ]; then
+    SZ=$(stat -c%s "$FOUND")
+    echo "RESULT[$LABEL]: SUCCESS json3=$(basename "$FOUND") bytes=$SZ"
+    python /tmp/parse_json3.py "$FOUND"
+  else
+    echo "RESULT[$LABEL]: FAILED (no .json3 file)"
+  fi
+  rm -rf "$DIR"
+}
+
+echo
+echo "=============================================="
+echo "SECTION B/C: PLAIN CAPTION FETCH (ClipMaker's exact flags)"
+echo "=============================================="
+run_caption_test "B-plain-short-dQw4w9WgXcQ"  dQw4w9WgXcQ
+run_caption_test "B2-plain-tiny-jNQXAC9IVRw"  jNQXAC9IVRw
+run_caption_test "C-plain-long-bTJggsMK6uQ"   bTJggsMK6uQ
+run_caption_test "C2-plain-long-77y4dn5Dgvs"  77y4dn5Dgvs
+
+echo
+echo "=============================================="
+echo "SECTION D: PLAYER_CLIENT MITIGATIONS (on dQw4w9WgXcQ)"
+echo "=============================================="
+for CLIENT in android ios tv_embedded web_safari mweb tv web_embedded default; do
+  run_caption_test "D-client-$CLIENT" dQw4w9WgXcQ --extractor-args "youtube:player_client=$CLIENT"
+done
+
+echo
+echo "=============================================="
+echo "SECTION D2: CLIENTS AGAINST THE LONG VIDEO"
+echo "=============================================="
+for CLIENT in android ios tv_embedded web_safari mweb; do
+  run_caption_test "D2-long-$CLIENT" bTJggsMK6uQ --extractor-args "youtube:player_client=$CLIENT"
+done
+
+echo
+echo "=============================================="
+echo "SECTION E: youtube-transcript-api LIBRARY"
+echo "=============================================="
+python -m pip install -q -U youtube-transcript-api 2>&1 | tail -3
+python -c "import youtube_transcript_api as m; print('youtube-transcript-api version:', getattr(m,'__version__','unknown'))"
+
+cat > /tmp/yta_test.py <<'PYEOF'
+import json
+from youtube_transcript_api import YouTubeTranscriptApi
+
+for vid in ["dQw4w9WgXcQ", "bTJggsMK6uQ"]:
+    ok = False
+    try:
+        api = YouTubeTranscriptApi()
+        fetched = api.fetch(vid)
+        raw = fetched.to_raw_data()
+        print("RESULT[E-new-api %s]: SUCCESS segments=%d first=%s"
+              % (vid, len(raw), json.dumps(raw[:1])[:200]))
+        ok = True
+    except Exception as e:
+        print("RESULT[E-new-api %s]: FAILED %s: %s" % (vid, type(e).__name__, str(e)[:700]))
+    if ok:
+        continue
+    try:
+        raw = YouTubeTranscriptApi.get_transcript(vid)
+        print("RESULT[E-old-api %s]: SUCCESS segments=%d first=%s"
+              % (vid, len(raw), json.dumps(raw[:1])[:200]))
+    except AttributeError:
+        print("RESULT[E-old-api %s]: N/A (get_transcript removed in this version)" % vid)
+    except Exception as e:
+        print("RESULT[E-old-api %s]: FAILED %s: %s" % (vid, type(e).__name__, str(e)[:700]))
+PYEOF
+python /tmp/yta_test.py
+
+echo
+echo "=============================================="
+echo "SECTION F: RAW TIMEDTEXT ENDPOINT"
+echo "=============================================="
+for U in \
+  "https://www.youtube.com/api/timedtext?lang=en&v=dQw4w9WgXcQ" \
+  "https://www.youtube.com/api/timedtext?lang=en&v=dQw4w9WgXcQ&fmt=json3" \
+  "https://video.google.com/timedtext?lang=en&v=dQw4w9WgXcQ" ; do
+  CODE=$(curl -s -o /tmp/tt.out -w "%{http_code}" --max-time 30 "$U")
+  echo "RESULT[F]: HTTP $CODE  bytes=$(stat -c%s /tmp/tt.out 2>/dev/null)  url=$U"
+  head -c 200 /tmp/tt.out; echo
+done
+
+echo "--- watch page reachability (is the IP blocked at all?) ---"
+CODE=$(curl -s -o /tmp/wp.out -w "%{http_code}" --max-time 30 "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+echo "RESULT[F-watchpage]: HTTP $CODE bytes=$(stat -c%s /tmp/wp.out 2>/dev/null)"
+echo -n "   consent-wall marker count: "
+grep -c "Sign in to confirm" /tmp/wp.out 2>/dev/null || echo 0
+
+echo
+echo "=============================================="
+echo "SECTION G: AUDIO DOWNLOAD (the no-captions / Whisper path)"
+echo "=============================================="
+DIR=$(mktemp -d)
+START=$(date +%s)
+$YTDLP -f "bestaudio/best" --no-progress --socket-timeout 30 \
+  -o "$DIR/%(id)s.%(ext)s" -- "https://www.youtube.com/watch?v=jNQXAC9IVRw" 2>&1 | tail -20
+RC=${PIPESTATUS[0]}
+echo "--- audio exit code: $RC elapsed: $(( $(date +%s) - START ))s ---"
+ls -la "$DIR"
+rm -rf "$DIR"
+
+echo
+echo "=============================================="
+echo "SECTION H: METADATA-ONLY CALL (cheapest bot-check canary)"
+echo "=============================================="
+$YTDLP --skip-download --print "%(title)s|%(duration)s" --no-progress -- "https://www.youtube.com/watch?v=dQw4w9WgXcQ" 2>&1 | tail -10
+echo "--- metadata exit code: ${PIPESTATUS[0]} ---"
+
+echo
+echo "=============================================="
+echo "PROBE COMPLETE"
+echo "=============================================="
