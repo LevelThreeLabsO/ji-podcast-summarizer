@@ -1,5 +1,8 @@
 name: probe-warpegress
-on: { workflow_dispatch: }
+on:
+  workflow_dispatch:
+  push:
+    paths: ['.github/workflows/probe-warpegress.yml']
 jobs:
   probe:
     runs-on: ubuntu-latest
