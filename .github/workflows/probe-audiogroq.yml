@@ -10,152 +10,108 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: '3.11' }
 
-      - name: 00 - environment
+      - name: 00 - setup (ffmpeg + deno JS runtime + yt-dlp nightly)
+        continue-on-error: true
         run: |
           set +e
-          echo "=== RUNNER EGRESS IP / ASN ==="
-          curl -s --max-time 20 https://ipinfo.io/json | head -20
-          echo
-          echo "=== ffmpeg ==="
-          which ffmpeg || echo "ffmpeg NOT on PATH"
-          ffmpeg -version 2>/dev/null | head -1
-          echo "=== preinstalled yt-dlp ==="
-          which yt-dlp || echo "yt-dlp NOT preinstalled"
-          yt-dlp --version 2>/dev/null
-          echo "=== docker ==="
-          docker --version
-          echo "=== node ==="
-          node --version
-
-      - name: 01 - install latest yt-dlp
-        run: |
-          set +e
-          python -m pip install -q -U "yt-dlp[default]"
-          echo "stable yt-dlp: $(yt-dlp --version)"
+          echo "=== egress ==="
+          curl -s --max-time 20 https://ipinfo.io/json | python3 -c "import json,sys;d=json.load(sys.stdin);print(d.get('ip'),d.get('org'),d.get('city'))"
+          echo "=== ffmpeg (BtbN static) ==="
+          mkdir -p ~/bin
+          curl -sSL --retry 3 --max-time 120 -o /tmp/ff.tar.xz \
+            https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz
+          tar -xJf /tmp/ff.tar.xz -C /tmp/
+          mv /tmp/ffmpeg-*/bin/ffmpeg /tmp/ffmpeg-*/bin/ffprobe ~/bin/
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/bin:$PATH"
+          ffmpeg -version | head -1
+          ffprobe -version | head -1
+          echo "=== deno (JS runtime yt-dlp now requires) ==="
+          curl -fsSL https://deno.land/install.sh | DENO_INSTALL=$HOME/.deno sh -s -- -y >/dev/null 2>&1
+          echo "$HOME/.deno/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.deno/bin:$PATH"
+          deno --version | head -1 || echo "deno install FAILED"
+          echo "=== yt-dlp ==="
           python -m pip install -q -U --pre "yt-dlp[default]"
-          echo "nightly yt-dlp: $(yt-dlp --version)"
-          echo "ffmpeg: $(ffmpeg -version 2>/dev/null | head -1)"
+          yt-dlp --version
+          exit 0
 
-      - name: 02a - yt-dlp audio, player_client matrix (short video)
+      # =================================================================
+      # HIGHEST VALUE FIRST: can Google fetch the YouTube video for us?
+      # Google's own servers do the fetching, so our datacenter IP is
+      # irrelevant. If this works the whole problem dissolves.
+      # =================================================================
+      - name: 01 - GEMINI direct YouTube URL ingestion
+        continue-on-error: true
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
           set +e
-          V="https://www.youtube.com/watch?v=jNQXAC9IVRw"
+          python3 - <<'PY'
+          import json, os, time, urllib.request, urllib.error
+          KEY = os.environ["GEMINI_API_KEY"]
+          VIDS = [("short 19s", "https://www.youtube.com/watch?v=jNQXAC9IVRw"),
+                  ("3.5 min",   "https://www.youtube.com/watch?v=dQw4w9WgXcQ"),
+                  ("long",      "https://www.youtube.com/watch?v=77y4dn5Dgvs")]
+          for MODEL in ["gemini-2.5-flash", "gemini-2.0-flash"]:
+              for label, V in VIDS:
+                  payload = {"contents": [{"parts": [
+                      {"text": "Transcribe the spoken audio of this video verbatim. Prefix each paragraph with a [mm:ss] timestamp."},
+                      {"file_data": {"file_uri": V}}]}]}
+                  req = urllib.request.Request(
+                      "https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent?key=%s" % (MODEL, KEY),
+                      data=json.dumps(payload).encode(),
+                      headers={"Content-Type": "application/json"}, method="POST")
+                  t0 = time.time()
+                  try:
+                      with urllib.request.urlopen(req, timeout=900) as r:
+                          d = json.loads(r.read())
+                      el = time.time() - t0
+                      txt = d["candidates"][0]["content"]["parts"][0]["text"]
+                      print("[%s] %s  HTTP 200  %.1fs  chars=%d" % (MODEL, label, el, len(txt)))
+                      print("   usage:", json.dumps(d.get("usageMetadata", {})))
+                      print("   head:", repr(txt[:280]))
+                      print("   tail:", repr(txt[-200:]))
+                  except urllib.error.HTTPError as e:
+                      el = time.time() - t0
+                      print("[%s] %s  HTTP %s  %.1fs" % (MODEL, label, e.code, el))
+                      print("   ", e.read()[:500].decode("utf8", "replace"))
+                  except Exception as e:
+                      print("[%s] %s  ERR %s %s" % (MODEL, label, type(e).__name__, e))
+                  print()
+          PY
+          exit 0
+
+      # =================================================================
+      # (b)(c) GROQ WHISPER FROM CI - measured on real speech audio
+      # =================================================================
+      - name: 02 - fetch real speech audio (archive.org, ~17 min)
+        continue-on-error: true
+        run: |
+          set +e
           mkdir -p /tmp/m && cd /tmp/m
-          for C in "DEFAULT" "tv" "web" "web_safari" "web_embedded" "mweb" "ios" "android" "android_vr" "tv_embedded" "tv_simply"; do
-            echo "-------------------------------------------------"
-            echo "### CLIENT: $C"
-            rm -f a.*
-            T0=$(date +%s)
-            if [ "$C" = "DEFAULT" ]; then
-              yt-dlp -x --audio-format mp3 -o "a.%(ext)s" --no-progress -- "$V" > out.txt 2> err.txt
-            else
-              yt-dlp -x --audio-format mp3 -o "a.%(ext)s" --no-progress \
-                --extractor-args "youtube:player_client=$C" -- "$V" > out.txt 2> err.txt
-            fi
-            RC=$?
-            T1=$(date +%s)
-            if [ $RC -eq 0 ] && [ -f a.mp3 ]; then
-              echo "RESULT: SUCCESS in $((T1-T0))s  size=$(stat -c%s a.mp3) bytes"
-            else
-              echo "RESULT: FAIL rc=$RC in $((T1-T0))s"
-              echo "--- stderr (last 6) ---"
-              tail -6 err.txt
-            fi
-          done
-
-      - name: 02b - yt-dlp metadata-only probe
-        run: |
-          set +e
-          for V in jNQXAC9IVRw dQw4w9WgXcQ 77y4dn5Dgvs bTJggsMK6uQ; do
-            echo "### $V"
-            yt-dlp --skip-download --print "%(title)s | dur=%(duration)s | %(id)s" \
-              --no-progress -- "https://www.youtube.com/watch?v=$V" 2>&1 | tail -4
-          done
-
-      - name: 03 - bgutil POT provider (docker) then retry clients
-        run: |
-          set +e
-          echo "=== starting bgutil pot provider ==="
-          docker run --name bgutil -d -p 4416:4416 brainicism/bgutil-ytdlp-pot-provider 2>&1 | tail -3
-          python -m pip install -q -U bgutil-ytdlp-pot-provider
-          echo "plugin installed"
-          for i in $(seq 1 25); do
-            curl -s --max-time 3 http://127.0.0.1:4416/ping >/dev/null 2>&1 && { echo "provider up after ${i}s"; break; }
-            sleep 1
-          done
-          curl -s --max-time 5 http://127.0.0.1:4416/ping; echo
-          echo "=== provider ping done ==="
-          cd /tmp/m
-          for C in "DEFAULT" "web" "web_safari" "tv" "mweb" "android_vr"; do
-            echo "-------------------------------------------------"
-            echo "### POT + CLIENT: $C"
-            rm -f p.*
-            T0=$(date +%s)
-            if [ "$C" = "DEFAULT" ]; then
-              yt-dlp -x --audio-format mp3 -o "p.%(ext)s" --no-progress -v \
-                -- "https://www.youtube.com/watch?v=jNQXAC9IVRw" > o.txt 2> e.txt
-            else
-              yt-dlp -x --audio-format mp3 -o "p.%(ext)s" --no-progress -v \
-                --extractor-args "youtube:player_client=$C" \
-                -- "https://www.youtube.com/watch?v=jNQXAC9IVRw" > o.txt 2> e.txt
-            fi
-            RC=$?; T1=$(date +%s)
-            if [ $RC -eq 0 ] && [ -f p.mp3 ]; then
-              echo "RESULT: SUCCESS in $((T1-T0))s size=$(stat -c%s p.mp3)"
-            else
-              echo "RESULT: FAIL rc=$RC in $((T1-T0))s"
-              grep -iE "pot|po_token|bgutil|sign in|bot|403|failed" e.txt | tail -8
-            fi
-          done
-          echo "=== provider container log ==="
-          docker logs bgutil 2>&1 | tail -15
-
-      - name: 04 - if it worked, pull a LONG video's audio
-        run: |
-          set +e
-          cd /tmp/m
-          echo "### long video 77y4dn5Dgvs"
-          T0=$(date +%s)
-          yt-dlp -x --audio-format mp3 -o "long.%(ext)s" --no-progress \
-            -- "https://www.youtube.com/watch?v=77y4dn5Dgvs" > lo.txt 2> le.txt
-          RC=$?; T1=$(date +%s)
-          echo "rc=$RC elapsed=$((T1-T0))s"
-          if [ -f long.mp3 ]; then
-            echo "LONG AUDIO OK size=$(stat -c%s long.mp3)"
-            ffprobe -v error -show_entries format=duration -of csv=p=0 long.mp3
-          else
-            tail -8 le.txt
-          fi
-
-      - name: 05 - fetch fallback speech audio (archive.org ~17 min)
-        run: |
-          set +e
-          cd /tmp/m
           T0=$(date +%s)
           curl -sSL --max-time 180 -o mlk.mp3 "https://archive.org/download/MLKDream/MLKDream_64kb.mp3"
           RC=$?; T1=$(date +%s)
           echo "download rc=$RC elapsed=$((T1-T0))s size=$(stat -c%s mlk.mp3 2>/dev/null)"
-          ffprobe -v error -show_entries format=duration -of csv=p=0 mlk.mp3
+          echo -n "duration(s): "; ffprobe -v error -show_entries format=duration -of csv=p=0 mlk.mp3
+          exit 0
 
-      - name: 06 - GROQ whisper + rate-limit headers
+      - name: 03 - GROQ whisper + rate-limit headers (TIMED)
+        continue-on-error: true
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
         run: |
           set +e
           cd /tmp/m
           if [ -z "$GROQ_API_KEY" ]; then echo "!! GROQ_API_KEY EMPTY"; exit 0; fi
-          for F in long.mp3 a.mp3 p.mp3 mlk.mp3; do
-            if [ -f "$F" ]; then SRC="$F"; break; fi
-          done
-          echo "source audio: $SRC ($(stat -c%s $SRC) bytes)"
-          echo -n "source duration (s): "; ffprobe -v error -show_entries format=duration -of csv=p=0 "$SRC"
-          echo "=== compress to opus 16k mono ==="
+          echo "=== compress 17-min mp3 -> opus 16k mono ==="
           T0=$(date +%s)
-          ffmpeg -y -v error -i "$SRC" -vn -ac 1 -ar 16000 -c:a libopus -b:a 16k \
+          ffmpeg -y -v error -i mlk.mp3 -vn -ac 1 -ar 16000 -c:a libopus -b:a 16k \
             -application voip -vbr on comp.opus
           RC=$?; T1=$(date +%s)
-          echo "ffmpeg rc=$RC elapsed=$((T1-T0))s size=$(stat -c%s comp.opus) bytes"
-          echo "=== GROQ transcription ==="
+          echo "ffmpeg rc=$RC elapsed=$((T1-T0))s  size=$(stat -c%s comp.opus) bytes"
+          echo "=== GROQ whisper-large-v3-turbo ==="
           T0=$(date +%s)
           HTTP=$(curl -s -o groq.json -w "%{http_code}" -D groq.hdr --max-time 600 \
             https://api.groq.com/openai/v1/audio/transcriptions \
@@ -164,48 +120,57 @@ jobs:
             -F model=whisper-large-v3-turbo \
             -F response_format=verbose_json)
           T1=$(date +%s)
-          echo "HTTP=$HTTP  elapsed=$((T1-T0))s"
+          echo ">>> HTTP=$HTTP  GROQ_ELAPSED=$((T1-T0))s  for 17 min of audio"
           echo "--- RATE LIMIT HEADERS ---"
           grep -i -E "x-ratelimit|retry-after" groq.hdr
-          echo "--- BODY ---"
+          echo "--- RESULT ---"
           python3 - <<'PY'
           import json
           try:
               d = json.load(open('groq.json'))
           except Exception:
               print('non-json:', open('groq.json').read()[:400]); raise SystemExit
-          t = d.get('text','')
+          t = d.get('text', '')
           print('chars:', len(t), 'segments:', len(d.get('segments') or []))
-          print('duration field:', d.get('duration'))
-          print(repr(t[:600]))
+          print('audio duration reported:', d.get('duration'))
+          print(repr(t[:500]))
           PY
+          exit 0
 
-      - name: 07 - GROQ models + quota after second call
+      - name: 04 - GROQ models + quota after a second call
+        continue-on-error: true
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
         run: |
           set +e
           cd /tmp/m
-          echo "=== whisper models available ==="
+          echo "=== whisper models available on this key ==="
           curl -s --max-time 30 https://api.groq.com/openai/v1/models \
             -H "Authorization: Bearer $GROQ_API_KEY" -o models.json
           python3 - <<'PY'
           import json
-          d = json.load(open('models.json'))
+          try:
+              d = json.load(open('models.json'))
+          except Exception:
+              print(open('models.json').read()[:300]); raise SystemExit
           for m in d.get('data', []):
-              i = m.get('id','')
+              i = m.get('id', '')
               if 'whisper' in i or 'distil' in i:
-                  print(i, '| owned_by', m.get('owned_by'), '| ctx', m.get('context_window'))
+                  print(' ', i, '| owned_by', m.get('owned_by'))
           PY
-          echo
-          echo "=== second call, read remaining quota ==="
+          echo "=== second transcription, to watch quota decrement ==="
           curl -s -o /dev/null -D h2.txt --max-time 300 \
             https://api.groq.com/openai/v1/audio/transcriptions \
             -H "Authorization: Bearer $GROQ_API_KEY" \
             -F file=@comp.opus -F model=whisper-large-v3-turbo -F response_format=json
           grep -i -E "x-ratelimit|retry-after" h2.txt
+          exit 0
 
-      - name: 08 - opus size for 60-min and 120-min audio
+      # =================================================================
+      # (d) THE 25MB LIMIT - real numbers for 60 and 120 minutes
+      # =================================================================
+      - name: 05 - opus size for 60-min and 120-min audio
+        continue-on-error: true
         run: |
           set +e
           cd /tmp/m
@@ -218,17 +183,19 @@ jobs:
             T1=$(date +%s)
             SZ=$(stat -c%s loop_${MINS}.opus)
             ENC=$((T1-T0))
-            echo "${MINS}min @16k -> $(python3 -c "print(f'{$SZ/1048576:.2f}')") MB  (encode ${ENC}s)"
+            echo ">>> ${MINS} min @16k opus = $(python3 -c "print(f'{$SZ/1048576:.2f}')") MB   (encode took ${ENC}s)"
           done
           echo "--- 120 min at other bitrates ---"
           for BR in 12k 24k 32k; do
             ffmpeg -y -v error -stream_loop -1 -i mlk.mp3 -t 7200 \
               -vn -ac 1 -ar 16000 -c:a libopus -b:a $BR -application voip -vbr on b_$BR.opus
             SZ2=$(stat -c%s b_$BR.opus)
-            echo "120min @ $BR -> $(python3 -c "print(f'{$SZ2/1048576:.2f}')") MB"
+            echo "    120 min @ $BR = $(python3 -c "print(f'{$SZ2/1048576:.2f}')") MB"
           done
+          exit 0
 
-      - name: 09 - does GROQ accept the 120-minute file?
+      - name: 06 - does GROQ actually accept a 2-HOUR file?
+        continue-on-error: true
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
         run: |
@@ -237,35 +204,47 @@ jobs:
           SZ=$(stat -c%s loop_120.opus)
           echo "uploading loop_120.opus = $(python3 -c "print(f'{$SZ/1048576:.2f}')") MB of 2h audio"
           T0=$(date +%s)
-          HTTP=$(curl -s -o g120.json -w "%{http_code}" -D g120.hdr --max-time 900 \
+          HTTP=$(curl -s -o g120.json -w "%{http_code}" -D g120.hdr --max-time 1200 \
             https://api.groq.com/openai/v1/audio/transcriptions \
             -H "Authorization: Bearer $GROQ_API_KEY" \
             -F file=@loop_120.opus -F model=whisper-large-v3-turbo -F response_format=json)
           T1=$(date +%s)
-          echo "HTTP=$HTTP elapsed=$((T1-T0))s"
+          echo ">>> HTTP=$HTTP  ELAPSED=$((T1-T0))s for 2 hours of audio"
           grep -i -E "x-ratelimit|retry-after" g120.hdr
-          head -c 600 g120.json; echo
+          python3 - <<'PY'
+          import json
+          try:
+              d = json.load(open('g120.json'))
+              t = d.get('text', '')
+              print('chars:', len(t))
+              print(repr(t[:200]))
+          except Exception:
+              print('body:', open('g120.json').read()[:500])
+          PY
+          exit 0
 
-      - name: 10 - Gemini audio transcription (inline + File API)
+      # =================================================================
+      # (e) GEMINI transcribing an uploaded audio file
+      # =================================================================
+      - name: 07 - GEMINI audio transcription (inline + File API)
+        continue-on-error: true
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
           set +e
           cd /tmp/m
-          if [ -z "$GEMINI_API_KEY" ]; then echo "!! GEMINI_API_KEY EMPTY"; exit 0; fi
           ffmpeg -y -v error -i mlk.mp3 -t 120 -vn -ac 1 -ar 16000 -c:a libopus -b:a 16k clip2min.opus
           echo "clip2min.opus = $(stat -c%s clip2min.opus) bytes"
           python3 - <<'PY'
           import base64, json, os, time, urllib.request, urllib.error
-
           KEY = os.environ["GEMINI_API_KEY"]
           MODEL = "gemini-2.5-flash"
 
-          def post(url, payload):
-              data = json.dumps(payload).encode()
-              req = urllib.request.Request(url, data=data,
-                                           headers={"Content-Type": "application/json"},
-                                           method="POST")
+          def post(payload):
+              req = urllib.request.Request(
+                  "https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent?key=%s" % (MODEL, KEY),
+                  data=json.dumps(payload).encode(),
+                  headers={"Content-Type": "application/json"}, method="POST")
               t0 = time.time()
               try:
                   with urllib.request.urlopen(req, timeout=900) as r:
@@ -275,39 +254,35 @@ jobs:
 
           print("=== TEST 1: inline_data, 2-minute opus ===")
           b = base64.b64encode(open("clip2min.opus", "rb").read()).decode()
-          print("base64 payload chars:", len(b))
-          code, body, secs = post(
-              "https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent?key=%s" % (MODEL, KEY),
-              {"contents": [{"parts": [
-                  {"text": "Transcribe this audio verbatim with timestamps."},
-                  {"inline_data": {"mime_type": "audio/ogg", "data": b}}]}]})
+          print("base64 chars:", len(b))
+          code, body, secs = post({"contents": [{"parts": [
+              {"text": "Transcribe this audio verbatim."},
+              {"inline_data": {"mime_type": "audio/ogg", "data": b}}]}]})
           print("HTTP", code, "%.1fs" % secs)
           if code == 200:
               try:
                   txt = body["candidates"][0]["content"]["parts"][0]["text"]
-                  print("usageMetadata:", json.dumps(body.get("usageMetadata", {})))
-                  print("chars:", len(txt))
-                  print(repr(txt[:500]))
+                  print("usage:", json.dumps(body.get("usageMetadata", {})))
+                  print("chars:", len(txt)); print(repr(txt[:400]))
               except Exception as e:
-                  print("parse err", e, json.dumps(body)[:600])
+                  print("parse err", e, json.dumps(body)[:500])
           else:
-              print(body if isinstance(body, str) else json.dumps(body)[:600])
+              print(body if isinstance(body, str) else json.dumps(body)[:500])
 
           print()
-          print("=== TEST 2: File API upload, full 17-minute mp3 ===")
-          path = "mlk.mp3"
-          size = os.path.getsize(path)
-          print("uploading", path, size, "bytes")
+          print("=== TEST 2: File API, full 17-minute mp3 ===")
+          path, size = "mlk.mp3", os.path.getsize("mlk.mp3")
+          print("uploading", size, "bytes")
           upload_url = None
-          req = urllib.request.Request(
-              "https://generativelanguage.googleapis.com/upload/v1beta/files?key=" + KEY,
-              data=json.dumps({"file": {"display_name": "probe"}}).encode(),
-              headers={"X-Goog-Upload-Protocol": "resumable",
-                       "X-Goog-Upload-Command": "start",
-                       "X-Goog-Upload-Header-Content-Length": str(size),
-                       "X-Goog-Upload-Header-Content-Type": "audio/mpeg",
-                       "Content-Type": "application/json"}, method="POST")
           try:
+              req = urllib.request.Request(
+                  "https://generativelanguage.googleapis.com/upload/v1beta/files?key=" + KEY,
+                  data=json.dumps({"file": {"display_name": "probe"}}).encode(),
+                  headers={"X-Goog-Upload-Protocol": "resumable",
+                           "X-Goog-Upload-Command": "start",
+                           "X-Goog-Upload-Header-Content-Length": str(size),
+                           "X-Goog-Upload-Header-Content-Type": "audio/mpeg",
+                           "Content-Type": "application/json"}, method="POST")
               with urllib.request.urlopen(req, timeout=120) as r:
                   upload_url = r.headers.get("X-Goog-Upload-URL")
               print("got upload url:", bool(upload_url))
@@ -317,17 +292,16 @@ jobs:
           file_uri = None
           if upload_url:
               t0 = time.time()
-              req = urllib.request.Request(
-                  upload_url, data=open(path, "rb").read(),
-                  headers={"Content-Length": str(size), "X-Goog-Upload-Offset": "0",
-                           "X-Goog-Upload-Command": "upload, finalize"}, method="POST")
               try:
+                  req = urllib.request.Request(
+                      upload_url, data=open(path, "rb").read(),
+                      headers={"Content-Length": str(size), "X-Goog-Upload-Offset": "0",
+                               "X-Goog-Upload-Command": "upload, finalize"}, method="POST")
                   with urllib.request.urlopen(req, timeout=900) as r:
                       info = json.loads(r.read())
                   print("upload took %.1fs" % (time.time() - t0))
                   f = info.get("file", {})
                   file_uri = f.get("uri")
-                  print("uri:", file_uri, "state:", f.get("state"))
                   for _ in range(40):
                       if f.get("state") == "ACTIVE":
                           break
@@ -335,90 +309,98 @@ jobs:
                       u = "https://generativelanguage.googleapis.com/v1beta/%s?key=%s" % (f.get("name"), KEY)
                       with urllib.request.urlopen(u, timeout=60) as r2:
                           f = json.loads(r2.read())
-                  print("final state:", f.get("state"))
+                  print("state:", f.get("state"), "uri:", file_uri)
               except urllib.error.HTTPError as e:
                   print("upload failed", e.code, e.read()[:400])
 
           if file_uri:
-              code, body, secs = post(
-                  "https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent?key=%s" % (MODEL, KEY),
-                  {"contents": [{"parts": [
-                      {"text": "Transcribe this audio verbatim. Put a [mm:ss] timestamp at the start of each paragraph."},
-                      {"file_data": {"mime_type": "audio/mpeg", "file_uri": file_uri}}]}]})
+              code, body, secs = post({"contents": [{"parts": [
+                  {"text": "Transcribe this audio verbatim. Prefix each paragraph with [mm:ss]."},
+                  {"file_data": {"mime_type": "audio/mpeg", "file_uri": file_uri}}]}]})
               print("HTTP", code, "%.1fs" % secs)
               if code == 200:
                   try:
                       txt = body["candidates"][0]["content"]["parts"][0]["text"]
-                      print("usageMetadata:", json.dumps(body.get("usageMetadata", {})))
-                      print("chars:", len(txt))
-                      print(repr(txt[:700]))
+                      print("usage:", json.dumps(body.get("usageMetadata", {})))
+                      print("chars:", len(txt)); print(repr(txt[:500]))
                   except Exception as e:
-                      print("parse err", e, json.dumps(body)[:600])
+                      print("parse err", e, json.dumps(body)[:500])
               else:
-                  print(body if isinstance(body, str) else json.dumps(body)[:800])
+                  print(body if isinstance(body, str) else json.dumps(body)[:600])
           PY
+          exit 0
 
-      - name: 11 - Gemini direct YouTube URL ingestion
-        env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      # =================================================================
+      # (a) RETRY yt-dlp now that deno (JS runtime) is present
+      # =================================================================
+      - name: 08 - yt-dlp WITH deno JS runtime + POT provider
+        continue-on-error: true
         run: |
           set +e
-          python3 - <<'PY'
-          import json, os, time, urllib.request, urllib.error
-          KEY = os.environ["GEMINI_API_KEY"]
-          for MODEL in ["gemini-2.5-flash", "gemini-2.0-flash"]:
-              for V in ["https://www.youtube.com/watch?v=jNQXAC9IVRw",
-                        "https://www.youtube.com/watch?v=77y4dn5Dgvs"]:
-                  payload = {"contents": [{"parts": [
-                      {"text": "Transcribe the spoken audio of this video verbatim with [mm:ss] timestamps."},
-                      {"file_data": {"file_uri": V}}]}]}
-                  req = urllib.request.Request(
-                      "https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent?key=%s" % (MODEL, KEY),
-                      data=json.dumps(payload).encode(),
-                      headers={"Content-Type": "application/json"}, method="POST")
-                  t0 = time.time()
-                  try:
-                      with urllib.request.urlopen(req, timeout=900) as r:
-                          d = json.loads(r.read())
-                      txt = d["candidates"][0]["content"]["parts"][0]["text"]
-                      print("[%s] %s  HTTP 200  %.1fs  chars=%d" % (MODEL, V, time.time() - t0, len(txt)))
-                      print("  usage:", json.dumps(d.get("usageMetadata", {})))
-                      print("  ", repr(txt[:400]))
-                  except urllib.error.HTTPError as e:
-                      print("[%s] %s  HTTP %s  %.1fs" % (MODEL, V, e.code, time.time() - t0))
-                      print("  ", e.read()[:500].decode("utf8", "replace"))
-                  except Exception as e:
-                      print("[%s] %s  ERR %s %s" % (MODEL, V, type(e).__name__, e))
-                  print()
-          PY
+          cd /tmp/m
+          echo "deno: $(deno --version 2>/dev/null | head -1)"
+          echo "=== start bgutil POT provider ==="
+          docker run --name bgutil -d -p 4416:4416 brainicism/bgutil-ytdlp-pot-provider >/dev/null 2>&1
+          python -m pip install -q -U bgutil-ytdlp-pot-provider
+          for i in $(seq 1 25); do
+            curl -s --max-time 3 http://127.0.0.1:4416/ping >/dev/null 2>&1 && { echo "provider up after ${i}s"; break; }
+            sleep 1
+          done
+          curl -s --max-time 5 http://127.0.0.1:4416/ping; echo
+          V="https://www.youtube.com/watch?v=jNQXAC9IVRw"
+          for C in "DEFAULT" "web" "mweb" "tv" "web_safari" "android_vr"; do
+            echo "------------------------------------"
+            echo "### deno+POT CLIENT: $C"
+            rm -f q.*
+            T0=$(date +%s)
+            if [ "$C" = "DEFAULT" ]; then
+              yt-dlp -f bestaudio -o "q.%(ext)s" --no-progress -- "$V" > o.txt 2> e.txt
+            else
+              yt-dlp -f bestaudio -o "q.%(ext)s" --no-progress \
+                --extractor-args "youtube:player_client=$C" -- "$V" > o.txt 2> e.txt
+            fi
+            RC=$?; T1=$(date +%s)
+            if [ $RC -eq 0 ] && ls q.* >/dev/null 2>&1; then
+              echo "RESULT: SUCCESS in $((T1-T0))s size=$(stat -c%s q.* | head -1)"
+            else
+              echo "RESULT: FAIL rc=$RC in $((T1-T0))s"
+              grep -iE "sign in|bot|403|ERROR" e.txt | tail -3
+            fi
+          done
+          exit 0
 
-      - name: 12 - caption-path cross-check
+      - name: 09 - caption path cross-check (with deno)
+        continue-on-error: true
         run: |
           set +e
           cd /tmp/m
           python -m pip install -q youtube-transcript-api
+          echo "=== youtube-transcript-api ==="
           python3 - <<'PY'
           from youtube_transcript_api import YouTubeTranscriptApi as A
           for v in ["jNQXAC9IVRw", "dQw4w9WgXcQ", "77y4dn5Dgvs"]:
               try:
                   try:
-                      t = A().fetch(v)
-                      print(v, "OK segments=", len(t.to_raw_data()))
+                      t = A().fetch(v); print(" ", v, "OK segments=", len(t.to_raw_data()))
                   except AttributeError:
-                      t = A.get_transcript(v)
-                      print(v, "OK segments=", len(t))
+                      t = A.get_transcript(v); print(" ", v, "OK segments=", len(t))
               except Exception as e:
-                  print(v, "FAIL", type(e).__name__, str(e)[:250].replace("\n", " "))
+                  print(" ", v, "FAIL", type(e).__name__, str(e)[:200].replace("\n", " "))
           PY
-          echo "--- yt-dlp subtitle-only path ---"
-          for V in jNQXAC9IVRw 77y4dn5Dgvs; do
+          echo "=== yt-dlp subtitles only ==="
+          for V in jNQXAC9IVRw dQw4w9WgXcQ; do
             rm -f s.*
             yt-dlp --skip-download --write-auto-sub --write-sub --sub-lang "en.*" \
-              --sub-format json3 -o "s" --no-progress -- "https://www.youtube.com/watch?v=$V" 2>&1 | tail -3
+              --sub-format json3 -o "s" --no-progress -- "https://www.youtube.com/watch?v=$V" 2>&1 | tail -2
             ls -la s.* 2>/dev/null || echo "  no subtitle file for $V"
           done
+          exit 0
 
-      - name: 13 - END-TO-END timing, real long video
+      # =================================================================
+      # (f) END TO END on a real long video, whichever path works
+      # =================================================================
+      - name: 10 - END-TO-END, real long video
+        continue-on-error: true
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
         run: |
@@ -429,12 +411,12 @@ jobs:
           W0=$(date +%s)
           T0=$(date +%s)
           rm -f e2e.*
-          yt-dlp -f "bestaudio" -o "e2e.%(ext)s" --no-progress -- "$V" > e1.txt 2> e2.txt
+          yt-dlp -f bestaudio -o "e2e.%(ext)s" --no-progress -- "$V" > e1.txt 2> e2.txt
           RC=$?; T1=$(date +%s)
           echo "STEP download: rc=$RC $((T1-T0))s"
           if [ $RC -ne 0 ]; then
-            tail -6 e2.txt
-            echo "E2E ABORTED - YouTube audio unavailable from this runner"
+            tail -4 e2.txt
+            echo "E2E via yt-dlp ABORTED - YouTube audio unavailable from this runner"
             exit 0
           fi
           F=$(ls e2e.* | head -1)
@@ -446,7 +428,7 @@ jobs:
           T1=$(date +%s)
           echo "STEP compress: $((T1-T0))s size=$(stat -c%s e2e.opus)"
           T0=$(date +%s)
-          HTTP=$(curl -s -o e2e.json -w "%{http_code}" -D e2e.hdr --max-time 900 \
+          HTTP=$(curl -s -o e2e.json -w "%{http_code}" -D e2e.hdr --max-time 1200 \
             https://api.groq.com/openai/v1/audio/transcriptions \
             -H "Authorization: Bearer $GROQ_API_KEY" \
             -F file=@e2e.opus -F model=whisper-large-v3-turbo -F response_format=verbose_json)
@@ -456,12 +438,12 @@ jobs:
           python3 - <<'PY'
           import json
           try:
-              d = json.load(open('e2e.json'))
-              t = d.get('text', '')
-              print('  transcript chars:', len(t), 'segments:', len(d.get('segments') or []))
-              print('  ', repr(t[:400]))
+              d = json.load(open('e2e.json')); t = d.get('text', '')
+              print('  chars:', len(t), 'segments:', len(d.get('segments') or []))
+              print('  ', repr(t[:300]))
           except Exception as e:
-              print('  parse fail', e, open('e2e.json').read()[:300])
+              print('  parse fail', e)
           PY
           W1=$(date +%s)
-          echo "=== TOTAL E2E WALL CLOCK: $((W1-W0))s ==="
+          echo ">>> TOTAL E2E WALL CLOCK: $((W1-W0))s"
+          exit 0
