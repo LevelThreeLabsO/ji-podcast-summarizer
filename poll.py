@@ -225,11 +225,25 @@ def _pick_original_track(tracks):
 
 
 def yt_transcript_via_ioapi(video_id):
-    """Cloud-native YouTube transcript via youtube-transcript.io API. Free tier
-    is 25/day, no residential IP required. Returns ({segments}, title, error).
+    """Cloud-native YouTube transcript via youtube-transcript.io API.
+    Returns ({segments}, title, error).
+
+    QUOTA: the free tier is 25 transcripts per MONTH, resetting on the 1st —
+    NOT per day. The original comment here said "25/day"; it was written 94
+    seconds after the token was created and was never sourced. The vendor's
+    pricing page has said "25 tokens per month" since at least June 2026, and
+    the logs prove the monthly reset independently: HTTP 402 at 2026-08-31
+    18:10Z, clean success at 2026-09-01 09:57Z with nobody touching the
+    account. Channel volume is ~30-40 links/month, so the allowance is
+    exhausted mid-cycle every month and has been since 2026-08-18.
+
+    One token buys one video. Repeat requests for a video the vendor already
+    holds appear not to be billed (a 2026-09-07 retry storm made ~400 requests
+    for one video, all HTTP 200, with further transcripts still delivered
+    afterwards).
 
     Used as the primary YouTube path when YT_TRANSCRIPT_IO_TOKEN is set —
-    ClipMaker on the Mac is fallback (residential IP, no daily cap)."""
+    ClipMaker on the Mac is the fallback (residential IP, no cap)."""
     token = os.environ.get("YT_TRANSCRIPT_IO_TOKEN") or ""
     if not token:
         return None, None, "YT_TRANSCRIPT_IO_TOKEN is not set"
@@ -249,8 +263,20 @@ def yt_transcript_via_ioapi(video_id):
 
     if r.status_code == 401:
         return None, None, "youtube-transcript.io rejected the token"
+    if r.status_code == 402:
+        # Monthly allowance exhausted. This is the status the vendor ACTUALLY
+        # returns when out of credits — 429 below was wired to the quota
+        # message and has never once appeared in any log across three repos.
+        # Because 402 previously fell through to the generic branch and matched
+        # nothing in _TRANSIENT_HINTS, quota exhaustion was silently classified
+        # permanent: every link quietly fell back to the Mac and nobody was
+        # told. That is why this ran unnoticed from 2026-08-18 to 2026-09-23.
+        # Marked transient so it retries after the 1st-of-month reset rather
+        # than being treated as a dead link.
+        return None, None, YT_QUOTA_EXHAUSTED
     if r.status_code == 429:
-        return None, None, "youtube-transcript.io daily quota hit (25/day free)"
+        # Genuine rate limit (vendor documents ~5 requests/10s with Retry-After).
+        return None, None, "youtube-transcript.io rate limited — backing off"
     if not r.ok:
         return None, None, f"youtube-transcript.io HTTP {r.status_code}: {r.text[:200]}"
 
@@ -1110,7 +1136,16 @@ class TransientError(Exception):
 # retry next tick instead of marking the message permanently done. Permanent
 # failures (e.g. "no captions" from ClipMaker) return 200 with an empty
 # segments list now, so they don't route through this classifier.
+# Sentinel for youtube-transcript.io's monthly-allowance-exhausted response.
+# Defined as a constant so the 402 branch, the transient classifier and the
+# Slack alert all key off exactly the same string and can't drift apart.
+YT_QUOTA_EXHAUSTED = (
+    "youtube-transcript.io monthly quota exhausted (25/month free tier) — "
+    "resets on the 1st; falling back to ClipMaker on the Mac until then"
+)
+
 _TRANSIENT_HINTS = (
+    "monthly quota exhausted",         # ioapi 402 — refills on the 1st
     "ClipMaker unreachable",
     "ClipMaker rejected the auth token",
     "CLIPMAKER_URL is not set",
@@ -1131,6 +1166,47 @@ def _is_transient(err_str):
         return False
     lower = err_str.lower()
     return any(h.lower() in lower for h in _TRANSIENT_HINTS)
+
+
+# Set when the ioapi quota alert has already been raised in this process, so a
+# run that processes several links warns at most once.
+_quota_warned = False
+
+
+def _warn_quota_exhausted(slack):
+    """Make an exhausted monthly allowance visible instead of silent.
+
+    Deliberately restrained. Standing rule for these bots is that automations
+    post only what was asked for and never invent channel chatter, so this:
+      - writes a loud line to the run log every time (free, no noise), and
+      - posts to Slack at most ONCE per process, and only when the caller
+        explicitly opted in via YT_QUOTA_ALERT_CHANNEL.
+    With no channel configured it stays log-only, and the non-zero exit at the
+    end of main() is what makes GitHub email the repo owner — the same
+    escalation path the eJP newswire uses.
+    """
+    global _quota_warned
+    if _quota_warned:
+        return
+    _quota_warned = True
+    print(f"  !! QUOTA: {YT_QUOTA_EXHAUSTED}", file=sys.stderr)
+
+    channel = os.environ.get("YT_QUOTA_ALERT_CHANNEL") or ""
+    if not channel or slack is None:
+        return
+    try:
+        slack._call("chat.postMessage", json_body={
+            "channel": channel,
+            "text": (":warning: youtube-transcript.io monthly allowance is used up "
+                     "(free tier: 25/month, resets on the 1st). YouTube links are "
+                     "falling back to ClipMaker on the Mac until then, so the Mac "
+                     "needs to stay awake with a live tunnel."),
+            "unfurl_links": False,
+            "unfurl_media": False,
+        })
+    except Exception as e:
+        # An alert that fails must never take down the run it is warning about.
+        print(f"  ! quota alert could not be posted: {type(e).__name__}", file=sys.stderr)
 
 
 def process_url(url, dry_run=False, slack=None, thread_ts=None):
@@ -1158,6 +1234,12 @@ def process_url(url, dry_run=False, slack=None, thread_ts=None):
         segments, cm_title, err = yt_transcript_via_ioapi(video_id)
         if err:
             print(f"  → ioapi failed: {err} — falling back to Mac")
+            if err is YT_QUOTA_EXHAUSTED or "monthly quota exhausted" in err:
+                # Surface it once per run. Silence here is exactly what let the
+                # quota sit dead from 2026-08-18 to 2026-09-23 while every link
+                # limped through the Mac — which then became a single point of
+                # failure the moment its tunnel died.
+                _warn_quota_exhausted(slack)
             segments, cm_title, err = yt_transcript_via_clipmaker(url)
             if err and _is_transient(err):
                 raise TransientError(f"YT transcript unreachable (both paths): {err}")
