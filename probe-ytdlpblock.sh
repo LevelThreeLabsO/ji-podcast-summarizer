@@ -1,181 +1,185 @@
 #!/usr/bin/env bash
-# TEMPORARY probe #2: can a JS runtime (deno/node), curl_cffi impersonation, or a
-# PO-token provider beat YouTube's datacenter-IP bot wall on GitHub Actions?
-# MODE is supplied by the workflow matrix. Delete after the run.
+# TEMPORARY probe #3: measure the real-world success rate of caption fetching from
+# a GH Actions IP, using REAL current news videos discovered from YouTube RSS
+# (no hand-picked IDs), with the maximal free config. Also tests Invidious/Piped.
+# Delete after the run.
 set +e
 
-MODE="${MODE:-baseline}"
+MODE="${MODE:-full}"
 echo "##############################################"
-echo "# MODE: $MODE"
+echo "# PROBE 3 — MODE: $MODE"
 echo "##############################################"
-echo "--- runner public IP / ASN ---"
-curl -s --max-time 20 https://ipinfo.io/json | grep -E '"ip"|"org"|"region"'
+curl -s --max-time 20 https://ipinfo.io/json | grep -E '"ip"|"org"'
 echo
 
-python -m pip install -q -U yt-dlp 2>&1 | tail -2
+python -m pip install -q -U "yt-dlp[default,curl-cffi]" 2>&1 | tail -2
 echo -n "yt-dlp version: "; python -m yt_dlp --version
+curl -fsSL https://deno.land/install.sh | sh -s -- -y >/dev/null 2>&1
+export PATH="$HOME/.deno/bin:$PATH"
+echo -n "deno: "; deno --version 2>/dev/null | head -1
 
-EXTRA_GLOBAL=()
+python -m pip install -q -U bgutil-ytdlp-pot-provider youtube-transcript-api 2>&1 | tail -2
+docker run --name bgutil-provider -d -p 4416:4416 \
+  brainicism/bgutil-ytdlp-pot-provider >/dev/null 2>&1
+for i in $(seq 1 30); do
+  curl -s --max-time 3 http://127.0.0.1:4416/ping >/dev/null 2>&1 && break
+  sleep 2
+done
+echo -n "bgutil provider: "; curl -s --max-time 5 http://127.0.0.1:4416/ping | head -c 200; echo
 
-case "$MODE" in
-  baseline)
-    echo "No JS runtime, no impersonation. Long video FIRST (ordering control)."
-    ;;
-  node)
-    echo "Using preinstalled Node as the JS runtime (zero install cost)."
-    node --version
-    EXTRA_GLOBAL+=(--js-runtimes "node")
-    ;;
-  deno)
-    echo "Installing Deno as the JS runtime."
-    curl -fsSL https://deno.land/install.sh | sh -s -- -y >/dev/null 2>&1
-    export PATH="$HOME/.deno/bin:$PATH"
-    deno --version | head -1
-    ;;
-  deno_impersonate)
-    echo "Deno + curl_cffi impersonation."
-    curl -fsSL https://deno.land/install.sh | sh -s -- -y >/dev/null 2>&1
-    export PATH="$HOME/.deno/bin:$PATH"
-    deno --version | head -1
-    python -m pip install -q -U "yt-dlp[default,curl-cffi]" 2>&1 | tail -2
-    python -c "from curl_cffi import requests; print('curl_cffi installed OK')" 2>&1 | tail -2
-    ;;
-  potoken)
-    echo "Deno + curl_cffi + bgutil PO-token provider (docker)."
-    curl -fsSL https://deno.land/install.sh | sh -s -- -y >/dev/null 2>&1
-    export PATH="$HOME/.deno/bin:$PATH"
-    deno --version | head -1
-    python -m pip install -q -U "yt-dlp[default,curl-cffi]" 2>&1 | tail -2
-    python -m pip install -q -U bgutil-ytdlp-pot-provider 2>&1 | tail -2
-    echo "--- starting bgutil provider container ---"
-    docker run --name bgutil-provider -d -p 4416:4416 \
-      brainicism/bgutil-ytdlp-pot-provider 2>&1 | tail -3
-    for i in $(seq 1 30); do
-      curl -s --max-time 3 http://127.0.0.1:4416/ping >/dev/null 2>&1 && break
-      sleep 2
-    done
-    echo -n "provider /ping: "
-    curl -s --max-time 5 http://127.0.0.1:4416/ping | head -c 300; echo
-    ;;
-esac
-
-echo "EXTRA_GLOBAL args: ${EXTRA_GLOBAL[*]:-<none>}"
+# ---------------------------------------------------------------------------
+# Discover REAL, CURRENT video IDs from YouTube channel RSS feeds.
+# RSS is unauthenticated and (per this test) not part of the bot wall, so it
+# gives us a genuine sample of the kind of video this bot actually processes:
+# news interviews, panels, hearings.
+# ---------------------------------------------------------------------------
+echo
+echo "=============================================="
+echo "DISCOVERING REAL VIDEO IDs FROM YOUTUBE RSS"
+echo "=============================================="
+declare -A CHANNELS=(
+  [CNN]=UCupvZG-5ko_eiXAupbDfxWw
+  [FoxNews]=UCXIJgqnII2ZOINSWNRGApHA
+  [PBSNewsHour]=UC6ZFN9Tx6xh-skXCuRHCDpQ
+  [MSNBC]=UCaXkIU1QidjPwiAYu6GcHjg
+  [CSPAN]=UCb--64Gl51jIEVE-GLDAVTg
+)
+: > /tmp/real_ids.txt
+for NAME in "${!CHANNELS[@]}"; do
+  CID="${CHANNELS[$NAME]}"
+  CODE=$(curl -s -o /tmp/rss.xml -w "%{http_code}" --max-time 25 \
+    "https://www.youtube.com/feeds/videos.xml?channel_id=$CID")
+  IDS=$(grep -oE "<yt:videoId>[^<]+</yt:videoId>" /tmp/rss.xml 2>/dev/null \
+        | sed -E 's#</?yt:videoId>##g' | head -2)
+  echo "RSS[$NAME]: HTTP $CODE  ids=$(echo $IDS | tr '\n' ' ')"
+  for I in $IDS; do echo "$NAME $I" >> /tmp/real_ids.txt; done
+done
+echo "--- discovered $(wc -l < /tmp/real_ids.txt) real video IDs ---"
 
 cat > /tmp/parse_json3.py <<'PYEOF'
 import json, sys
 d = json.load(open(sys.argv[1]))
 n = 0
-first = ""
 for e in d.get("events", []):
-    t = "".join(s.get("utf8", "") for s in (e.get("segs") or [])).strip()
-    if t:
+    if "".join(s.get("utf8", "") for s in (e.get("segs") or [])).strip():
         n += 1
-        if not first:
-            first = t
-print("   parsed_segments=%d first_segment=%r" % (n, first[:80]))
+print("   parsed_segments=%d" % n)
 PYEOF
 
+PASS=0; FAIL=0; BOTWALL=0
 run_caption_test () {
-  LABEL="$1"; VID="$2"; shift 2
+  LABEL="$1"; VID="$2"
   DIR=$(mktemp -d)
   echo
-  echo "======================================================"
-  echo "TEST: $LABEL  (video=$VID)  mode=$MODE"
-  echo "extra args: $*"
-  echo "------------------------------------------------------"
-  START=$(date +%s)
-  python -m yt_dlp --skip-download --write-subs --write-auto-subs \
+  echo "--- TEST $LABEL ($VID) ---"
+  OUT=$(python -m yt_dlp --skip-download --write-subs --write-auto-subs \
     --sub-langs "en,en-orig,en-US,en-GB" --sub-format json3 \
-    --no-progress --socket-timeout 30 \
-    "${EXTRA_GLOBAL[@]}" "$@" -o "$DIR/%(id)s" \
-    -- "https://www.youtube.com/watch?v=$VID" 2>&1 | grep -vE "^\[download\]" | tail -18
-  RC=${PIPESTATUS[0]}
-  END=$(date +%s)
-  echo "--- exit code: $RC   elapsed: $((END-START))s ---"
+    --no-progress --socket-timeout 30 -o "$DIR/%(id)s" \
+    -- "https://www.youtube.com/watch?v=$VID" 2>&1)
   FOUND=$(ls "$DIR"/*.json3 2>/dev/null | head -1)
   if [ -n "$FOUND" ]; then
-    echo "RESULT[$MODE/$LABEL]: SUCCESS json3=$(basename "$FOUND") bytes=$(stat -c%s "$FOUND")"
+    echo "RESULT[$LABEL $VID]: SUCCESS bytes=$(stat -c%s "$FOUND")"
     python /tmp/parse_json3.py "$FOUND"
+    PASS=$((PASS+1))
   else
-    echo "RESULT[$MODE/$LABEL]: FAILED (no .json3 file)"
+    if echo "$OUT" | grep -q "not a bot"; then
+      echo "RESULT[$LABEL $VID]: FAILED-BOTWALL"
+      BOTWALL=$((BOTWALL+1))
+    else
+      echo "RESULT[$LABEL $VID]: FAILED-OTHER"
+    fi
+    echo "$OUT" | grep -E "^ERROR" | head -2 | sed 's/^/    /'
+    FAIL=$((FAIL+1))
   fi
   rm -rf "$DIR"
 }
 
-# LONG REAL-WORLD VIDEO FIRST — this is the ordering control. In probe #1 the
-# only success was the very first request of the run, so the long videos were
-# never tested from a "fresh" runner state.
 echo
 echo "=============================================="
-echo "CAPTION TESTS (long real-world video FIRST)"
+echo "REAL NEWS VIDEOS — yt-dlp caption fetch"
 echo "=============================================="
-run_caption_test "1st-long-bTJggsMK6uQ"  bTJggsMK6uQ
-run_caption_test "2nd-long-77y4dn5Dgvs"  77y4dn5Dgvs
-run_caption_test "3rd-tiny-jNQXAC9IVRw"  jNQXAC9IVRw
-run_caption_test "4th-rickroll-dQw4w9WgXcQ" dQw4w9WgXcQ
+while read -r NAME VID; do
+  [ -z "$VID" ] && continue
+  run_caption_test "$NAME" "$VID"
+done < /tmp/real_ids.txt
 
-if [ "$MODE" = "potoken" ]; then
-  echo
-  echo "=============================================="
-  echo "PO-TOKEN CLIENT VARIANTS"
-  echo "=============================================="
-  for CLIENT in mweb tv web web_safari; do
-    run_caption_test "pot-$CLIENT-bTJggsMK6uQ" bTJggsMK6uQ \
-      --extractor-args "youtube:player_client=$CLIENT"
-  done
-fi
+echo
+echo "--- CONTROL: dQw4w9WgXcQ (the one that kept passing in probes 1-2) ---"
+run_caption_test "CONTROL" dQw4w9WgXcQ
 
-if [ "$MODE" = "deno_impersonate" ]; then
-  echo
-  echo "=============================================="
-  echo "IMPERSONATION TARGET VARIANTS (long video)"
-  echo "=============================================="
-  python -m yt_dlp --list-impersonate-targets 2>&1 | head -15
-  for TGT in chrome safari edge; do
-    run_caption_test "imp-$TGT-bTJggsMK6uQ" bTJggsMK6uQ --impersonate "$TGT"
-  done
-fi
+echo
+echo "=============================================================="
+echo "yt-dlp TALLY: PASS=$PASS FAIL=$FAIL (of which bot-wall=$BOTWALL)"
+echo "=============================================================="
 
 echo
 echo "=============================================="
-echo "youtube-transcript-api (same runner/IP)"
+echo "youtube-transcript-api ON THE SAME REAL IDs"
 echo "=============================================="
-python -m pip install -q -U youtube-transcript-api 2>&1 | tail -2
+cut -d' ' -f2 /tmp/real_ids.txt > /tmp/ids_only.txt
+echo dQw4w9WgXcQ >> /tmp/ids_only.txt
 cat > /tmp/yta_test.py <<'PYEOF'
-import json, os
 from youtube_transcript_api import YouTubeTranscriptApi
-mode = os.environ.get("MODE", "?")
-for vid in ["bTJggsMK6uQ", "77y4dn5Dgvs", "dQw4w9WgXcQ"]:
+ok = bad = 0
+for vid in [l.strip() for l in open("/tmp/ids_only.txt") if l.strip()]:
     try:
         raw = YouTubeTranscriptApi().fetch(vid).to_raw_data()
-        print("RESULT[%s/yta %s]: SUCCESS segments=%d first=%s"
-              % (mode, vid, len(raw), json.dumps(raw[:1])[:160]))
+        print("RESULT[yta %s]: SUCCESS segments=%d" % (vid, len(raw)))
+        ok += 1
     except Exception as e:
-        print("RESULT[%s/yta %s]: FAILED %s: %s"
-              % (mode, vid, type(e).__name__, str(e)[:400].replace("\n", " ")))
+        print("RESULT[yta %s]: FAILED %s" % (vid, type(e).__name__))
+        bad += 1
+print("YTA TALLY: PASS=%d FAIL=%d" % (ok, bad))
 PYEOF
 python /tmp/yta_test.py
 
 echo
 echo "=============================================="
-echo "AUDIO DOWNLOAD (no-captions / Whisper path)"
+echo "INVIDIOUS / PIPED PUBLIC INSTANCES (free proxies)"
+echo "=============================================="
+TESTID=$(head -1 /tmp/ids_only.txt)
+echo "using real video id: $TESTID"
+echo "--- fetching current Invidious instance list ---"
+curl -s --max-time 25 "https://api.invidious.io/instances.json?sort_by=health" \
+  -o /tmp/inv.json
+python - <<'PYEOF' > /tmp/inv_hosts.txt 2>/dev/null
+import json
+try:
+    d = json.load(open("/tmp/inv.json"))
+    hosts = [x[0] for x in d if x[1].get("api") and x[1].get("type") in ("https",)]
+    print("\n".join(hosts[:6]))
+except Exception as e:
+    pass
+PYEOF
+echo "instances found: $(wc -l < /tmp/inv_hosts.txt)"
+while read -r H; do
+  [ -z "$H" ] && continue
+  CODE=$(curl -s -o /tmp/iv.out -w "%{http_code}" --max-time 25 \
+    "https://$H/api/v1/captions/$TESTID")
+  echo "RESULT[invidious $H]: HTTP $CODE bytes=$(stat -c%s /tmp/iv.out 2>/dev/null)"
+  head -c 150 /tmp/iv.out; echo
+done < /tmp/inv_hosts.txt
+
+for P in pipedapi.kavin.rocks pipedapi.adminforge.de api.piped.private.coffee; do
+  CODE=$(curl -s -o /tmp/pp.out -w "%{http_code}" --max-time 25 \
+    "https://$P/streams/$TESTID")
+  echo "RESULT[piped $P]: HTTP $CODE bytes=$(stat -c%s /tmp/pp.out 2>/dev/null)"
+  head -c 150 /tmp/pp.out; echo
+done
+
+echo
+echo "=============================================="
+echo "AUDIO DOWNLOAD on a REAL news video (Whisper path)"
 echo "=============================================="
 DIR=$(mktemp -d)
-START=$(date +%s)
 python -m yt_dlp -f "bestaudio/best" --no-progress --socket-timeout 30 \
-  "${EXTRA_GLOBAL[@]}" -o "$DIR/%(id)s.%(ext)s" \
-  -- "https://www.youtube.com/watch?v=jNQXAC9IVRw" 2>&1 | grep -vE "^\[download\]\s+[0-9]" | tail -12
-RC=${PIPESTATUS[0]}
-echo "--- audio exit code: $RC elapsed: $(( $(date +%s) - START ))s ---"
-ls -la "$DIR" | tail -5
-if ls "$DIR"/* >/dev/null 2>&1; then
-  echo "RESULT[$MODE/audio-jNQXAC9IVRw]: SUCCESS"
-else
-  echo "RESULT[$MODE/audio-jNQXAC9IVRw]: FAILED"
-fi
+  -o "$DIR/%(id)s.%(ext)s" -- "https://www.youtube.com/watch?v=$TESTID" 2>&1 \
+  | grep -vE "^\[download\]\s+[0-9]" | tail -8
+ls -la "$DIR" | tail -3
+if ls "$DIR"/* >/dev/null 2>&1; then echo "RESULT[audio-real]: SUCCESS"; else echo "RESULT[audio-real]: FAILED"; fi
 rm -rf "$DIR"
 
 echo
 echo "=============================================="
-echo "PROBE COMPLETE — MODE $MODE"
+echo "PROBE 3 COMPLETE"
 echo "=============================================="
