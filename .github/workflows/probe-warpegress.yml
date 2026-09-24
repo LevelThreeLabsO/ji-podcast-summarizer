@@ -9,65 +9,70 @@ jobs:
         with: { python-version: '3.11' }
       - name: install yt-dlp
         run: pip install -U yt-dlp && yt-dlp --version
-      - name: A. baseline egress identity (no WARP)
+      - name: A. DIRECT baseline, one caption track per video (fair comparison)
         run: |
           set +e
-          echo "--- cloudflare trace, direct ---"
           curl -s --max-time 20 https://www.cloudflare.com/cdn-cgi/trace | grep -E '^(ip|loc|warp)='
-      - name: B. baseline yt-dlp, direct datacenter IP
-        run: |
-          set +e
-          for V in dQw4w9WgXcQ 77y4dn5Dgvs; do
-            echo "=== DIRECT $V ==="
-            timeout 120 yt-dlp --skip-download --write-auto-subs --write-subs \
-              --sub-langs "en.*" --sub-format vtt -o "direct-$V" \
-              "https://www.youtube.com/watch?v=$V" 2>&1 | tail -20
-            echo "exit=$?"
+          OK=0; FAIL=0
+          for V in dQw4w9WgXcQ jNQXAC9IVRw 77y4dn5Dgvs bTJggsMK6uQ; do
+            timeout 120 yt-dlp --skip-download --write-auto-subs --sub-langs "en" \
+              --sub-format vtt -o "d-$V" "https://www.youtube.com/watch?v=$V" >"d-$V.log" 2>&1
+            if ls d-$V*.vtt >/dev/null 2>&1; then
+              echo "DIRECT $V OK $(wc -c < $(ls d-$V*.vtt | head -1)) bytes"; OK=$((OK+1))
+            else
+              echo "DIRECT $V FAIL: $(grep -m1 -E 'ERROR|WARNING: .*sub' "d-$V.log" | cut -c1-120)"; FAIL=$((FAIL+1))
+            fi
+            sleep 2
           done
-          ls -la direct-* 2>/dev/null || echo "NO SUBTITLE FILES FROM DIRECT PATH"
-      - name: C. bring up Cloudflare WARP via wgcf + wireproxy (userspace, no routing change)
+          echo "DIRECT TOTALS ok=$OK fail=$FAIL"
+      - name: B. bring up Cloudflare WARP (wgcf + wireproxy, userspace SOCKS5)
         run: |
           set +e
-          WGCF_URL=$(curl -s https://api.github.com/repos/ViRb3/wgcf/releases/latest | grep -o 'https://[^"]*linux_amd64' | head -1)
-          echo "wgcf: $WGCF_URL"
-          curl -sL "$WGCF_URL" -o wgcf && chmod +x wgcf && ./wgcf --version
-          ./wgcf register --accept-tos 2>&1 | tail -5
-          ./wgcf generate 2>&1 | tail -5
-          echo "--- profile (keys redacted) ---"
-          sed -E 's/^(PrivateKey|PublicKey).*/\1 = <redacted>/' wgcf-profile.conf
-          WP_URL="https://github.com/windtf/wireproxy/releases/download/v1.1.3/wireproxy_linux_amd64.tar.gz"
-          echo "wireproxy: $WP_URL"
-          curl -sL "$WP_URL" -o wp.tgz && tar xzf wp.tgz && ls -la && chmod +x wireproxy && ./wireproxy --version
+          curl -sL "https://github.com/ViRb3/wgcf/releases/download/v2.3.0/wgcf_2.3.0_linux_amd64" -o wgcf
+          chmod +x wgcf
+          ./wgcf register --accept-tos 2>&1 | tail -2
+          ./wgcf generate 2>&1 | tail -1
+          curl -sL "https://github.com/windtf/wireproxy/releases/download/v1.1.3/wireproxy_linux_amd64.tar.gz" -o wp.tgz
+          tar xzf wp.tgz && chmod +x wireproxy
           cp wgcf-profile.conf warp.conf
           printf '\n[Socks5]\nBindAddress = 127.0.0.1:25344\n' >> warp.conf
           nohup ./wireproxy -c warp.conf > wireproxy.log 2>&1 &
-          for i in $(seq 1 20); do
-            sleep 2
-            curl -s --socks5-hostname 127.0.0.1:25344 --max-time 10 https://www.cloudflare.com/cdn-cgi/trace -o trace.txt && break
-          done
-          echo "--- cloudflare trace THROUGH WARP ---"
+          for i in $(seq 1 20); do sleep 2; curl -s --socks5-hostname 127.0.0.1:25344 --max-time 10 https://www.cloudflare.com/cdn-cgi/trace -o trace.txt && break; done
           grep -E '^(ip|loc|warp)=' trace.txt || { echo "PROXY NEVER CAME UP"; tail -20 wireproxy.log; }
-      - name: D. yt-dlp THROUGH WARP egress
+      - name: C. WARP, one caption track per video, two passes
         run: |
           set +e
-          for V in dQw4w9WgXcQ jNQXAC9IVRw 77y4dn5Dgvs bTJggsMK6uQ; do
-            echo "=== WARP $V ==="
-            S=$(date +%s)
-            timeout 180 yt-dlp --proxy socks5h://127.0.0.1:25344 \
-              --skip-download --write-auto-subs --write-subs \
-              --sub-langs "en.*" --sub-format vtt -o "warp-$V" \
-              "https://www.youtube.com/watch?v=$V" 2>&1 | tail -15
-            echo "exit=$? elapsed=$(( $(date +%s) - S ))s"
+          P=socks5h://127.0.0.1:25344
+          for PASS in 1 2; do
+            OK=0; FAIL=0
+            for V in dQw4w9WgXcQ jNQXAC9IVRw 77y4dn5Dgvs bTJggsMK6uQ; do
+              S=$(date +%s)
+              timeout 180 yt-dlp --proxy $P --skip-download --write-auto-subs --sub-langs "en" \
+                --sub-format vtt -o "w$PASS-$V" "https://www.youtube.com/watch?v=$V" >"w$PASS-$V.log" 2>&1
+              E=$(( $(date +%s) - S ))
+              if ls w$PASS-$V*.vtt >/dev/null 2>&1; then
+                echo "WARP p$PASS $V OK $(wc -c < $(ls w$PASS-$V*.vtt | head -1)) bytes in ${E}s"; OK=$((OK+1))
+              else
+                echo "WARP p$PASS $V FAIL in ${E}s: $(grep -m1 -E 'ERROR' "w$PASS-$V.log" | cut -c1-140)"; FAIL=$((FAIL+1))
+              fi
+              sleep 2
+            done
+            echo "WARP PASS $PASS TOTALS ok=$OK fail=$FAIL"
           done
-          echo "--- files produced ---"
-          ls -la warp-* 2>/dev/null || echo "NO SUBTITLE FILES FROM WARP PATH"
-          for f in warp-*.vtt; do [ -f "$f" ] && echo "$f bytes=$(wc -c < "$f") lines=$(wc -l < "$f")"; done
-      - name: E. WARP path, audio download for a captionless case (speed check)
+      - name: D. WARP, long-video audio download end to end (speed for the no-captions path)
         run: |
           set +e
-          echo "=== audio via WARP (timing only, 1 video) ==="
-          S=$(date +%s)
-          timeout 300 yt-dlp --proxy socks5h://127.0.0.1:25344 -f "bestaudio[ext=m4a]/bestaudio" \
-            -o aud.%\(ext\)s "https://www.youtube.com/watch?v=dQw4w9WgXcQ" 2>&1 | tail -8
-          echo "exit=$? elapsed=$(( $(date +%s) - S ))s"
-          ls -la aud.* 2>/dev/null || echo "NO AUDIO"
+          P=socks5h://127.0.0.1:25344
+          echo "ffmpeg: $(ffmpeg -version 2>/dev/null | head -1)"
+          for V in 77y4dn5Dgvs bTJggsMK6uQ; do
+            S=$(date +%s)
+            timeout 600 yt-dlp --proxy $P -f "bestaudio[ext=m4a]/bestaudio" \
+              -o "a-$V.%(ext)s" "https://www.youtube.com/watch?v=$V" > "a-$V.log" 2>&1
+            E=$(( $(date +%s) - S ))
+            DUR=$(ffprobe -v error -show_entries format=duration -of csv=p=0 a-$V.* 2>/dev/null | head -1)
+            echo "AUDIO $V elapsed=${E}s size=$(du -h a-$V.* 2>/dev/null | head -1) duration_sec=$DUR"
+            grep -m1 ERROR "a-$V.log" | cut -c1-140
+            S=$(date +%s)
+            ffmpeg -loglevel error -y -i $(ls a-$V.* | head -1) -ac 1 -ar 16000 -c:a libopus -b:a 16k "o-$V.ogg" 2>&1 | tail -2
+            echo "REENCODE $V elapsed=$(( $(date +%s) - S ))s out=$(du -h o-$V.ogg 2>/dev/null | head -1)"
+          done
