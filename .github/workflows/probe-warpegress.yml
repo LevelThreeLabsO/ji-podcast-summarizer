@@ -35,9 +35,9 @@ jobs:
           ./wgcf generate 2>&1 | tail -5
           echo "--- profile (keys redacted) ---"
           sed -E 's/^(PrivateKey|PublicKey).*/\1 = <redacted>/' wgcf-profile.conf
-          WP_URL=$(curl -s https://api.github.com/repos/pufferffish/wireproxy/releases/latest | grep -o 'https://[^"]*linux_amd64\.tar\.gz' | head -1)
+          WP_URL="https://github.com/windtf/wireproxy/releases/download/v1.1.3/wireproxy_linux_amd64.tar.gz"
           echo "wireproxy: $WP_URL"
-          curl -sL "$WP_URL" -o wp.tgz && tar xzf wp.tgz && chmod +x wireproxy && ./wireproxy --version
+          curl -sL "$WP_URL" -o wp.tgz && tar xzf wp.tgz && ls -la && chmod +x wireproxy && ./wireproxy --version
           cp wgcf-profile.conf warp.conf
           printf '\n[Socks5]\nBindAddress = 127.0.0.1:25344\n' >> warp.conf
           nohup ./wireproxy -c warp.conf > wireproxy.log 2>&1 &
@@ -53,7 +53,7 @@ jobs:
           for V in dQw4w9WgXcQ jNQXAC9IVRw 77y4dn5Dgvs bTJggsMK6uQ; do
             echo "=== WARP $V ==="
             S=$(date +%s)
-            timeout 180 yt-dlp --proxy socks5://127.0.0.1:25344 \
+            timeout 180 yt-dlp --proxy socks5h://127.0.0.1:25344 \
               --skip-download --write-auto-subs --write-subs \
               --sub-langs "en.*" --sub-format vtt -o "warp-$V" \
               "https://www.youtube.com/watch?v=$V" 2>&1 | tail -15
@@ -67,7 +67,7 @@ jobs:
           set +e
           echo "=== audio via WARP (timing only, 1 video) ==="
           S=$(date +%s)
-          timeout 300 yt-dlp --proxy socks5://127.0.0.1:25344 -f "bestaudio[ext=m4a]/bestaudio" \
+          timeout 300 yt-dlp --proxy socks5h://127.0.0.1:25344 -f "bestaudio[ext=m4a]/bestaudio" \
             -o aud.%\(ext\)s "https://www.youtube.com/watch?v=dQw4w9WgXcQ" 2>&1 | tail -8
           echo "exit=$? elapsed=$(( $(date +%s) - S ))s"
           ls -la aud.* 2>/dev/null || echo "NO AUDIO"
