@@ -1,0 +1,73 @@
+name: probe-warpegress
+on: { workflow_dispatch: }
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - name: install yt-dlp
+        run: pip install -U yt-dlp && yt-dlp --version
+      - name: A. baseline egress identity (no WARP)
+        run: |
+          set +e
+          echo "--- cloudflare trace, direct ---"
+          curl -s --max-time 20 https://www.cloudflare.com/cdn-cgi/trace | grep -E '^(ip|loc|warp)='
+      - name: B. baseline yt-dlp, direct datacenter IP
+        run: |
+          set +e
+          for V in dQw4w9WgXcQ 77y4dn5Dgvs; do
+            echo "=== DIRECT $V ==="
+            timeout 120 yt-dlp --skip-download --write-auto-subs --write-subs \
+              --sub-langs "en.*" --sub-format vtt -o "direct-$V" \
+              "https://www.youtube.com/watch?v=$V" 2>&1 | tail -20
+            echo "exit=$?"
+          done
+          ls -la direct-* 2>/dev/null || echo "NO SUBTITLE FILES FROM DIRECT PATH"
+      - name: C. bring up Cloudflare WARP via wgcf + wireproxy (userspace, no routing change)
+        run: |
+          set +e
+          WGCF_URL=$(curl -s https://api.github.com/repos/ViRb3/wgcf/releases/latest | grep -o 'https://[^"]*linux_amd64' | head -1)
+          echo "wgcf: $WGCF_URL"
+          curl -sL "$WGCF_URL" -o wgcf && chmod +x wgcf && ./wgcf --version
+          ./wgcf register --accept-tos 2>&1 | tail -5
+          ./wgcf generate 2>&1 | tail -5
+          echo "--- profile (keys redacted) ---"
+          sed -E 's/^(PrivateKey|PublicKey).*/\1 = <redacted>/' wgcf-profile.conf
+          WP_URL=$(curl -s https://api.github.com/repos/pufferffish/wireproxy/releases/latest | grep -o 'https://[^"]*linux_amd64\.tar\.gz' | head -1)
+          echo "wireproxy: $WP_URL"
+          curl -sL "$WP_URL" -o wp.tgz && tar xzf wp.tgz && chmod +x wireproxy && ./wireproxy --version
+          cp wgcf-profile.conf warp.conf
+          printf '\n[Socks5]\nBindAddress = 127.0.0.1:25344\n' >> warp.conf
+          nohup ./wireproxy -c warp.conf > wireproxy.log 2>&1 &
+          for i in $(seq 1 20); do
+            sleep 2
+            curl -s --socks5-hostname 127.0.0.1:25344 --max-time 10 https://www.cloudflare.com/cdn-cgi/trace -o trace.txt && break
+          done
+          echo "--- cloudflare trace THROUGH WARP ---"
+          grep -E '^(ip|loc|warp)=' trace.txt || { echo "PROXY NEVER CAME UP"; tail -20 wireproxy.log; }
+      - name: D. yt-dlp THROUGH WARP egress
+        run: |
+          set +e
+          for V in dQw4w9WgXcQ jNQXAC9IVRw 77y4dn5Dgvs bTJggsMK6uQ; do
+            echo "=== WARP $V ==="
+            S=$(date +%s)
+            timeout 180 yt-dlp --proxy socks5://127.0.0.1:25344 \
+              --skip-download --write-auto-subs --write-subs \
+              --sub-langs "en.*" --sub-format vtt -o "warp-$V" \
+              "https://www.youtube.com/watch?v=$V" 2>&1 | tail -15
+            echo "exit=$? elapsed=$(( $(date +%s) - S ))s"
+          done
+          echo "--- files produced ---"
+          ls -la warp-* 2>/dev/null || echo "NO SUBTITLE FILES FROM WARP PATH"
+          for f in warp-*.vtt; do [ -f "$f" ] && echo "$f bytes=$(wc -c < "$f") lines=$(wc -l < "$f")"; done
+      - name: E. WARP path, audio download for a captionless case (speed check)
+        run: |
+          set +e
+          echo "=== audio via WARP (timing only, 1 video) ==="
+          S=$(date +%s)
+          timeout 300 yt-dlp --proxy socks5://127.0.0.1:25344 -f "bestaudio[ext=m4a]/bestaudio" \
+            -o aud.%\(ext\)s "https://www.youtube.com/watch?v=dQw4w9WgXcQ" 2>&1 | tail -8
+          echo "exit=$? elapsed=$(( $(date +%s) - S ))s"
+          ls -la aud.* 2>/dev/null || echo "NO AUDIO"
