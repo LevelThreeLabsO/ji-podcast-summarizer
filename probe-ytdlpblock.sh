@@ -1,33 +1,72 @@
 #!/usr/bin/env bash
-# TEMPORARY probe: does YouTube block yt-dlp from GitHub Actions datacenter IPs?
-# Delete after the run.
+# TEMPORARY probe #2: can a JS runtime (deno/node), curl_cffi impersonation, or a
+# PO-token provider beat YouTube's datacenter-IP bot wall on GitHub Actions?
+# MODE is supplied by the workflow matrix. Delete after the run.
 set +e
 
-echo "=============================================="
-echo "SECTION 0: ENVIRONMENT"
-echo "=============================================="
+MODE="${MODE:-baseline}"
+echo "##############################################"
+echo "# MODE: $MODE"
+echo "##############################################"
 echo "--- runner public IP / ASN ---"
-curl -s --max-time 20 https://ipinfo.io/json | head -20
+curl -s --max-time 20 https://ipinfo.io/json | grep -E '"ip"|"org"|"region"'
 echo
-echo "--- preinstalled yt-dlp ---"
-which yt-dlp && yt-dlp --version
-echo "--- ffmpeg ---"
-which ffmpeg && ffmpeg -version 2>/dev/null | head -1
-echo
-echo "--- upgrading yt-dlp to latest ---"
-python -m pip install -q -U yt-dlp 2>&1 | tail -3
-echo -n "yt-dlp version after upgrade: "
-python -m yt_dlp --version
 
-YTDLP="python -m yt_dlp"
+python -m pip install -q -U yt-dlp 2>&1 | tail -2
+echo -n "yt-dlp version: "; python -m yt_dlp --version
+
+EXTRA_GLOBAL=()
+
+case "$MODE" in
+  baseline)
+    echo "No JS runtime, no impersonation. Long video FIRST (ordering control)."
+    ;;
+  node)
+    echo "Using preinstalled Node as the JS runtime (zero install cost)."
+    node --version
+    EXTRA_GLOBAL+=(--js-runtimes "node")
+    ;;
+  deno)
+    echo "Installing Deno as the JS runtime."
+    curl -fsSL https://deno.land/install.sh | sh -s -- -y >/dev/null 2>&1
+    export PATH="$HOME/.deno/bin:$PATH"
+    deno --version | head -1
+    ;;
+  deno_impersonate)
+    echo "Deno + curl_cffi impersonation."
+    curl -fsSL https://deno.land/install.sh | sh -s -- -y >/dev/null 2>&1
+    export PATH="$HOME/.deno/bin:$PATH"
+    deno --version | head -1
+    python -m pip install -q -U "yt-dlp[default,curl-cffi]" 2>&1 | tail -2
+    python -c "from curl_cffi import requests; print('curl_cffi installed OK')" 2>&1 | tail -2
+    ;;
+  potoken)
+    echo "Deno + curl_cffi + bgutil PO-token provider (docker)."
+    curl -fsSL https://deno.land/install.sh | sh -s -- -y >/dev/null 2>&1
+    export PATH="$HOME/.deno/bin:$PATH"
+    deno --version | head -1
+    python -m pip install -q -U "yt-dlp[default,curl-cffi]" 2>&1 | tail -2
+    python -m pip install -q -U bgutil-ytdlp-pot-provider 2>&1 | tail -2
+    echo "--- starting bgutil provider container ---"
+    docker run --name bgutil-provider -d -p 4416:4416 \
+      brainicism/bgutil-ytdlp-pot-provider 2>&1 | tail -3
+    for i in $(seq 1 30); do
+      curl -s --max-time 3 http://127.0.0.1:4416/ping >/dev/null 2>&1 && break
+      sleep 2
+    done
+    echo -n "provider /ping: "
+    curl -s --max-time 5 http://127.0.0.1:4416/ping | head -c 300; echo
+    ;;
+esac
+
+echo "EXTRA_GLOBAL args: ${EXTRA_GLOBAL[*]:-<none>}"
 
 cat > /tmp/parse_json3.py <<'PYEOF'
 import json, sys
 d = json.load(open(sys.argv[1]))
-ev = d.get("events", [])
 n = 0
 first = ""
-for e in ev:
+for e in d.get("events", []):
     t = "".join(s.get("utf8", "") for s in (e.get("segs") or [])).strip()
     if t:
         n += 1
@@ -41,130 +80,102 @@ run_caption_test () {
   DIR=$(mktemp -d)
   echo
   echo "======================================================"
-  echo "TEST: $LABEL  (video=$VID)"
+  echo "TEST: $LABEL  (video=$VID)  mode=$MODE"
   echo "extra args: $*"
   echo "------------------------------------------------------"
   START=$(date +%s)
-  $YTDLP --skip-download --write-subs --write-auto-subs \
+  python -m yt_dlp --skip-download --write-subs --write-auto-subs \
     --sub-langs "en,en-orig,en-US,en-GB" --sub-format json3 \
     --no-progress --socket-timeout 30 \
-    "$@" -o "$DIR/%(id)s" -- "https://www.youtube.com/watch?v=$VID" 2>&1 | tail -25
+    "${EXTRA_GLOBAL[@]}" "$@" -o "$DIR/%(id)s" \
+    -- "https://www.youtube.com/watch?v=$VID" 2>&1 | grep -vE "^\[download\]" | tail -18
   RC=${PIPESTATUS[0]}
   END=$(date +%s)
   echo "--- exit code: $RC   elapsed: $((END-START))s ---"
-  echo "--- files produced ---"
-  ls -la "$DIR" 2>/dev/null | tail -10
   FOUND=$(ls "$DIR"/*.json3 2>/dev/null | head -1)
   if [ -n "$FOUND" ]; then
-    SZ=$(stat -c%s "$FOUND")
-    echo "RESULT[$LABEL]: SUCCESS json3=$(basename "$FOUND") bytes=$SZ"
+    echo "RESULT[$MODE/$LABEL]: SUCCESS json3=$(basename "$FOUND") bytes=$(stat -c%s "$FOUND")"
     python /tmp/parse_json3.py "$FOUND"
   else
-    echo "RESULT[$LABEL]: FAILED (no .json3 file)"
+    echo "RESULT[$MODE/$LABEL]: FAILED (no .json3 file)"
   fi
   rm -rf "$DIR"
 }
 
+# LONG REAL-WORLD VIDEO FIRST — this is the ordering control. In probe #1 the
+# only success was the very first request of the run, so the long videos were
+# never tested from a "fresh" runner state.
 echo
 echo "=============================================="
-echo "SECTION B/C: PLAIN CAPTION FETCH (ClipMaker's exact flags)"
+echo "CAPTION TESTS (long real-world video FIRST)"
 echo "=============================================="
-run_caption_test "B-plain-short-dQw4w9WgXcQ"  dQw4w9WgXcQ
-run_caption_test "B2-plain-tiny-jNQXAC9IVRw"  jNQXAC9IVRw
-run_caption_test "C-plain-long-bTJggsMK6uQ"   bTJggsMK6uQ
-run_caption_test "C2-plain-long-77y4dn5Dgvs"  77y4dn5Dgvs
+run_caption_test "1st-long-bTJggsMK6uQ"  bTJggsMK6uQ
+run_caption_test "2nd-long-77y4dn5Dgvs"  77y4dn5Dgvs
+run_caption_test "3rd-tiny-jNQXAC9IVRw"  jNQXAC9IVRw
+run_caption_test "4th-rickroll-dQw4w9WgXcQ" dQw4w9WgXcQ
+
+if [ "$MODE" = "potoken" ]; then
+  echo
+  echo "=============================================="
+  echo "PO-TOKEN CLIENT VARIANTS"
+  echo "=============================================="
+  for CLIENT in mweb tv web web_safari; do
+    run_caption_test "pot-$CLIENT-bTJggsMK6uQ" bTJggsMK6uQ \
+      --extractor-args "youtube:player_client=$CLIENT"
+  done
+fi
+
+if [ "$MODE" = "deno_impersonate" ]; then
+  echo
+  echo "=============================================="
+  echo "IMPERSONATION TARGET VARIANTS (long video)"
+  echo "=============================================="
+  python -m yt_dlp --list-impersonate-targets 2>&1 | head -15
+  for TGT in chrome safari edge; do
+    run_caption_test "imp-$TGT-bTJggsMK6uQ" bTJggsMK6uQ --impersonate "$TGT"
+  done
+fi
 
 echo
 echo "=============================================="
-echo "SECTION D: PLAYER_CLIENT MITIGATIONS (on dQw4w9WgXcQ)"
+echo "youtube-transcript-api (same runner/IP)"
 echo "=============================================="
-for CLIENT in android ios tv_embedded web_safari mweb tv web_embedded default; do
-  run_caption_test "D-client-$CLIENT" dQw4w9WgXcQ --extractor-args "youtube:player_client=$CLIENT"
-done
-
-echo
-echo "=============================================="
-echo "SECTION D2: CLIENTS AGAINST THE LONG VIDEO"
-echo "=============================================="
-for CLIENT in android ios tv_embedded web_safari mweb; do
-  run_caption_test "D2-long-$CLIENT" bTJggsMK6uQ --extractor-args "youtube:player_client=$CLIENT"
-done
-
-echo
-echo "=============================================="
-echo "SECTION E: youtube-transcript-api LIBRARY"
-echo "=============================================="
-python -m pip install -q -U youtube-transcript-api 2>&1 | tail -3
-python -c "import youtube_transcript_api as m; print('youtube-transcript-api version:', getattr(m,'__version__','unknown'))"
-
+python -m pip install -q -U youtube-transcript-api 2>&1 | tail -2
 cat > /tmp/yta_test.py <<'PYEOF'
-import json
+import json, os
 from youtube_transcript_api import YouTubeTranscriptApi
-
-for vid in ["dQw4w9WgXcQ", "bTJggsMK6uQ"]:
-    ok = False
+mode = os.environ.get("MODE", "?")
+for vid in ["bTJggsMK6uQ", "77y4dn5Dgvs", "dQw4w9WgXcQ"]:
     try:
-        api = YouTubeTranscriptApi()
-        fetched = api.fetch(vid)
-        raw = fetched.to_raw_data()
-        print("RESULT[E-new-api %s]: SUCCESS segments=%d first=%s"
-              % (vid, len(raw), json.dumps(raw[:1])[:200]))
-        ok = True
+        raw = YouTubeTranscriptApi().fetch(vid).to_raw_data()
+        print("RESULT[%s/yta %s]: SUCCESS segments=%d first=%s"
+              % (mode, vid, len(raw), json.dumps(raw[:1])[:160]))
     except Exception as e:
-        print("RESULT[E-new-api %s]: FAILED %s: %s" % (vid, type(e).__name__, str(e)[:700]))
-    if ok:
-        continue
-    try:
-        raw = YouTubeTranscriptApi.get_transcript(vid)
-        print("RESULT[E-old-api %s]: SUCCESS segments=%d first=%s"
-              % (vid, len(raw), json.dumps(raw[:1])[:200]))
-    except AttributeError:
-        print("RESULT[E-old-api %s]: N/A (get_transcript removed in this version)" % vid)
-    except Exception as e:
-        print("RESULT[E-old-api %s]: FAILED %s: %s" % (vid, type(e).__name__, str(e)[:700]))
+        print("RESULT[%s/yta %s]: FAILED %s: %s"
+              % (mode, vid, type(e).__name__, str(e)[:400].replace("\n", " ")))
 PYEOF
 python /tmp/yta_test.py
 
 echo
 echo "=============================================="
-echo "SECTION F: RAW TIMEDTEXT ENDPOINT"
-echo "=============================================="
-for U in \
-  "https://www.youtube.com/api/timedtext?lang=en&v=dQw4w9WgXcQ" \
-  "https://www.youtube.com/api/timedtext?lang=en&v=dQw4w9WgXcQ&fmt=json3" \
-  "https://video.google.com/timedtext?lang=en&v=dQw4w9WgXcQ" ; do
-  CODE=$(curl -s -o /tmp/tt.out -w "%{http_code}" --max-time 30 "$U")
-  echo "RESULT[F]: HTTP $CODE  bytes=$(stat -c%s /tmp/tt.out 2>/dev/null)  url=$U"
-  head -c 200 /tmp/tt.out; echo
-done
-
-echo "--- watch page reachability (is the IP blocked at all?) ---"
-CODE=$(curl -s -o /tmp/wp.out -w "%{http_code}" --max-time 30 "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
-echo "RESULT[F-watchpage]: HTTP $CODE bytes=$(stat -c%s /tmp/wp.out 2>/dev/null)"
-echo -n "   consent-wall marker count: "
-grep -c "Sign in to confirm" /tmp/wp.out 2>/dev/null || echo 0
-
-echo
-echo "=============================================="
-echo "SECTION G: AUDIO DOWNLOAD (the no-captions / Whisper path)"
+echo "AUDIO DOWNLOAD (no-captions / Whisper path)"
 echo "=============================================="
 DIR=$(mktemp -d)
 START=$(date +%s)
-$YTDLP -f "bestaudio/best" --no-progress --socket-timeout 30 \
-  -o "$DIR/%(id)s.%(ext)s" -- "https://www.youtube.com/watch?v=jNQXAC9IVRw" 2>&1 | tail -20
+python -m yt_dlp -f "bestaudio/best" --no-progress --socket-timeout 30 \
+  "${EXTRA_GLOBAL[@]}" -o "$DIR/%(id)s.%(ext)s" \
+  -- "https://www.youtube.com/watch?v=jNQXAC9IVRw" 2>&1 | grep -vE "^\[download\]\s+[0-9]" | tail -12
 RC=${PIPESTATUS[0]}
 echo "--- audio exit code: $RC elapsed: $(( $(date +%s) - START ))s ---"
-ls -la "$DIR"
+ls -la "$DIR" | tail -5
+if ls "$DIR"/* >/dev/null 2>&1; then
+  echo "RESULT[$MODE/audio-jNQXAC9IVRw]: SUCCESS"
+else
+  echo "RESULT[$MODE/audio-jNQXAC9IVRw]: FAILED"
+fi
 rm -rf "$DIR"
 
 echo
 echo "=============================================="
-echo "SECTION H: METADATA-ONLY CALL (cheapest bot-check canary)"
-echo "=============================================="
-$YTDLP --skip-download --print "%(title)s|%(duration)s" --no-progress -- "https://www.youtube.com/watch?v=dQw4w9WgXcQ" 2>&1 | tail -10
-echo "--- metadata exit code: ${PIPESTATUS[0]} ---"
-
-echo
-echo "=============================================="
-echo "PROBE COMPLETE"
+echo "PROBE COMPLETE — MODE $MODE"
 echo "=============================================="
