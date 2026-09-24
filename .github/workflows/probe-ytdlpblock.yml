@@ -10,9 +10,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: test
+      - name: gemini-youtube-ingestion
         env:
-          MODE: full
-          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        run: bash probe-ytdlpblock.sh
+        run: python probe-ytdlpblock-gemini.py
