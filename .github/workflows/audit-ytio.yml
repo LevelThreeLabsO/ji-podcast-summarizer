@@ -1,0 +1,29 @@
+name: audit-ytio (temporary probe)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Probe youtube-transcript.io with the shared token
+        env:
+          TOKEN: ${{ secrets.YT_TRANSCRIPT_IO_TOKEN }}
+        run: |
+          set +x
+          date -u
+          echo "TOKEN_LEN=${#TOKEN}"
+          code=$(curl -sS -o /tmp/body.txt -D /tmp/headers.txt -w '%{http_code}' \
+            -X POST https://www.youtube-transcript.io/api/transcripts \
+            -H "Authorization: Basic $TOKEN" \
+            -H "Content-Type: application/json" \
+            -d '{"ids":["dQw4w9WgXcQ"]}')
+          echo "HTTP_STATUS=$code"
+          echo "BODY_BYTES=$(wc -c < /tmp/body.txt)"
+          echo "---RESPONSE_HEADERS---"
+          grep -iv 'set-cookie' /tmp/headers.txt
+          echo "---BODY_HEAD_1500---"
+          head -c 1500 /tmp/body.txt
+          echo
+          echo "---END---"
