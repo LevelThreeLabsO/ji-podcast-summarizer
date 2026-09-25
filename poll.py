@@ -1373,7 +1373,21 @@ def main():
     first_run = not state.get("last_ts")
 
     print(f"Polling since ts={since} ({'first run baseline' if first_run else 'resume'})")
-    history = slack.history(since)
+    try:
+        history = slack.history(since)
+    except RuntimeError as e:
+        # not_in_channel: the app is installed and the token is valid, but nobody
+        # has run `/invite @<bot>` in the target channel yet. That is a setup step,
+        # not a fault — exit 0 with an instruction instead of failing ~2,800 runs a
+        # day. eJP crashed on exactly this from 2026-09-22 to 2026-09-25; the guard
+        # existed in circuit-podcast-summarizer but was never ported here, so eJP
+        # (scaffolded from this file) inherited the gap.
+        if "not_in_channel" in str(e):
+            print(f"Bot is not in channel {slack.channel} yet — run "
+                  f"`/invite @<bot name>` in that channel; this will start "
+                  f"working on the next tick.")
+            return
+        raise
 
     messages = history.get("messages", [])
     print(f"  → {len(messages)} messages in window")
