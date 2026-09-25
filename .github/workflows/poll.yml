@@ -58,7 +58,11 @@ jobs:
         # and the next tick is dispatched. 8 min gives a slow podcast enough
         # room; anything past that is stuck and worth killing.
         timeout-minutes: 8
-        run: python3 poll.py
+        # -u: unbuffered. Without it Python block-buffers stdout when the
+        # step output is piped, so a run killed by the step timeout shows
+        # ZERO progress lines and there is no way to tell where it hung.
+        # Cost us a blind 8-minute timeout on 2026-09-25.
+        run: python3 -u poll.py
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
