@@ -41,11 +41,43 @@ TWEET_RE = re.compile(
     r"https?://(?:www\.|mobile\.)?"
     r"(?:twitter\.com|x\.com)/[^/\s]+/status/(\d+)"
 )
+# News-site VIDEO pages. These are .html URLs, so they used to fall through to
+# ARTICLE_RE and get run through text extraction — which returns nothing useful,
+# because the words are in the audio. A NYT Opinion video posted 2026-09-25 hit
+# HTTP 403 on the article fetch and was silently dropped, even though yt-dlp
+# handles nytimes.com natively and the video had English captions (93 min,
+# 1,314 segments once routed correctly).
+#
+# Matched BEFORE ARTICLE_RE so a video page takes the transcript path. Kept to
+# hosts whose video URLs are unambiguous plus the near-universal /video/ path
+# segment, so ordinary articles are not misrouted. yt-dlp supports all of these.
+VIDEO_PAGE_RE = re.compile(
+    r"https?://[^\s>|<]*?(?:"
+    r"nytimes\.com/(?:video|.*?/video)/|"
+    r"bloomberg\.com/news/videos?/|"
+    r"c-span\.org/video/|"
+    r"cnn\.com/(?:videos?|.*?/video)/|"
+    r"washingtonpost\.com/video/|"
+    r"reuters\.com/video/|"
+    r"wsj\.com/video/|"
+    r"foxnews\.com/video/|"
+    r"nbcnews\.com/video/|"
+    r"cbsnews\.com/video/|"
+    r"abcnews\.go\.com/video/|"
+    r"pbs\.org/video/|"
+    r"axios\.com/video/|"
+    r"politico\.com/video/|"
+    r"vimeo\.com/\d+|"
+    r"dailymotion\.com/video/|"
+    r"rumble\.com/v|"
+    r"facebook\.com/watch"
+    r")[^\s>|<]*"
+)
+
 # Generic http(s) URL — used as a fallback for news articles etc. Comes LAST
-# in dispatch so YT/Twitter/podcast URLs take priority.
-# Generic http(s) URL. We rstrip common trailing punctuation on the match
-# before use since Slack often includes a period/paren from the surrounding
-# sentence in the message text.
+# in dispatch so YT/Twitter/podcast/video URLs take priority.
+# We rstrip common trailing punctuation on the match before use since Slack
+# often includes a period/paren from the surrounding sentence in the message text.
 ARTICLE_RE = re.compile(r"https?://[^\s>|<]+")
 _URL_TRAILING_JUNK = ".,!?;:)]\"'"
 
@@ -650,6 +682,110 @@ def podcast_transcript_direct(url):
     return segments, title, None
 
 
+_VTT_TIME_RE = re.compile(
+    r"(\d{1,2}):(\d{2}):(\d{2})[.,](\d{1,3})\s*-->\s*"
+    r"(\d{1,2}):(\d{2}):(\d{2})[.,](\d{1,3})"
+)
+_VTT_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _parse_vtt(raw):
+    """WebVTT text → [{text, start, duration}] in the same shape every other
+    transcript path returns. Cue settings, styling tags, and the header block
+    are dropped; consecutive lines inside one cue are joined with a space."""
+    segments = []
+    cur_start = cur_end = None
+    cur_lines = []
+
+    def flush():
+        if cur_start is None:
+            return
+        text = " ".join(cur_lines).strip()
+        text = _VTT_TAG_RE.sub("", text).strip()
+        if text:
+            segments.append({
+                "text": text,
+                "start": cur_start,
+                "duration": max(0.1, cur_end - cur_start),
+            })
+
+    for line in raw.splitlines():
+        line = line.strip()
+        m = _VTT_TIME_RE.search(line)
+        if m:
+            flush()
+            h1, m1, s1, ms1, h2, m2, s2, ms2 = (int(g) for g in m.groups())
+            cur_start = h1 * 3600 + m1 * 60 + s1 + ms1 / 1000.0
+            cur_end = h2 * 3600 + m2 * 60 + s2 + ms2 / 1000.0
+            cur_lines = []
+            continue
+        if not line or line == "WEBVTT" or line.startswith(("NOTE", "STYLE",
+                                                            "REGION",
+                                                            "X-TIMESTAMP-MAP")):
+            continue
+        if cur_start is not None:
+            cur_lines.append(line)
+    flush()
+    return segments
+
+
+def video_page_transcript_direct(url):
+    """Cloud-native transcript for a news-site video page, straight from the
+    site's own caption track. Costs no Groq quota, needs no Mac, and finishes in
+    ~1.5s where transcribing the same 93-minute NYT video takes ~100s.
+
+    Only MANUAL subtitle tracks are requested (no --write-auto-subs), so a
+    machine-translated track can never be quoted — the same rule
+    _pick_original_track enforces on the YouTube path, applied here by simply
+    never asking for auto-generated tracks. Returns ({segments}, title, error).
+    """
+    import glob
+    import subprocess
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        out = os.path.join(tmpdir, "sub.%(ext)s")
+        proc = subprocess.run(
+            ["yt-dlp", "--skip-download",
+             "--write-subs", "--sub-langs", "all", "--sub-format", "vtt",
+             "-o", out, "--", url],
+            capture_output=True, text=True, timeout=180,
+        )
+        if proc.returncode != 0:
+            err_lines = (proc.stderr or "").strip().splitlines()
+            return None, None, f"yt-dlp failed: {err_lines[-1] if err_lines else 'unknown'}"
+
+        vtts = sorted(glob.glob(os.path.join(tmpdir, "sub.*.vtt")))
+        if not vtts:
+            return None, None, "no caption track on this video"
+
+        # Prefer an English track when the site ships several; otherwise take
+        # the first, which for a single-language news video is the original.
+        chosen = next((p for p in vtts if os.path.basename(p) == "sub.en.vtt"),
+                      None)
+        if chosen is None:
+            chosen = next((p for p in vtts
+                           if os.path.basename(p).startswith("sub.en")), vtts[0])
+
+        with open(chosen, encoding="utf-8", errors="replace") as f:
+            segments = _parse_vtt(f.read())
+        if not segments:
+            return None, None, "caption track parsed to zero segments"
+
+        title = None
+        try:
+            tp = subprocess.run(
+                ["yt-dlp", "--skip-download", "--print", "title", "--", url],
+                capture_output=True, text=True, timeout=60,
+            )
+            if tp.returncode == 0 and tp.stdout.strip():
+                title = tp.stdout.strip().splitlines()[0]
+        except Exception:
+            pass
+
+    return segments, title, None
+
+
 def podcast_transcript_via_clipmaker(url):
     """Fetch podcast audio transcript by POSTing to ClipMaker's
     /api/podcast-transcript on the user's Mac. ClipMaker downloads the audio
@@ -1224,7 +1360,9 @@ def process_url(url, dry_run=False, slack=None, thread_ts=None):
     yt_match = YOUTUBE_RE.search(url)
     tweet_match = TWEET_RE.search(url)
     pod_match = PODCAST_RE.search(url)
-    article_match = ARTICLE_RE.search(url) if not (yt_match or tweet_match or pod_match) else None
+    video_match = VIDEO_PAGE_RE.search(url) if not (yt_match or tweet_match or pod_match) else None
+    article_match = (ARTICLE_RE.search(url)
+                     if not (yt_match or tweet_match or pod_match or video_match) else None)
 
     if yt_match:
         video_id = yt_match.group(1)
@@ -1295,6 +1433,35 @@ def process_url(url, dry_run=False, slack=None, thread_ts=None):
                 return None, False
             reply = build_tweet_reply(tweet, verdict)
             is_summary = True
+    elif video_match:
+        print(f"  → Video page {url}")
+        # A news-site video page. The words are in the audio, not the HTML, so
+        # this takes the transcript path, not the article path. Three tiers,
+        # cheapest first:
+        #   1. the site's own caption track  — free, ~1.5s, no Mac, no Groq
+        #   2. cloud yt-dlp + Groq Whisper   — no Mac, costs Groq quota
+        #   3. ClipMaker on the Mac          — residential IP, last resort
+        segments, vid_title, err = video_page_transcript_direct(url)
+        if err:
+            print(f"  → captions unavailable: {err} — transcribing audio")
+            segments, vid_title, err = podcast_transcript_direct(url)
+        if err:
+            print(f"  → direct path failed: {err} — falling back to Mac")
+            segments, vid_title, err = yt_transcript_via_clipmaker(url)
+            if err and _is_transient(err):
+                raise TransientError(f"Video transcript unreachable (all paths): {err}")
+        if err or not segments:
+            print(f"  → video transcript unavailable (permanent): {err or 'no segments'}")
+            return None, False
+        title = vid_title if vid_title and vid_title != "video" else url
+        transcript_text = format_transcript_for_llm(segments)
+        print(f"  → {len(segments)} segments, ~{len(transcript_text)} chars")
+        moments = summarize(transcript_text, title)
+        print(f"  → {len(moments)} notable moments")
+        if not moments:
+            return None, False
+        reply = build_reply(title, moments)
+        is_summary = True
     elif article_match:
         print(f"  → Article {url}")
         article = fetch_article(url)
