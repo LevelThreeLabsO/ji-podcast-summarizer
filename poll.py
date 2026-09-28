@@ -1536,8 +1536,11 @@ def process_url(url, dry_run=False, slack=None, thread_ts=None):
     if yt_match:
         video_id = yt_match.group(1)
         print(f"  → YouTube video {video_id}")
-        # Primary: cloud-native via youtube-transcript.io (free tier 25/day,
-        # no Mac needed). Fallback: ClipMaker on Mac (residential IP, no cap).
+        # Tier 1: youtube-transcript.io — the only tier that yields a real
+        # caption file, so the only one whose pull-quotes can be checked
+        # against a source. Free tier is 25 per MONTH, resetting on the 1st,
+        # against a channel that runs 30-40 links a month: structurally short,
+        # so tiers 2 and 3 are the normal case, not the exception.
         segments, cm_title, err = yt_transcript_via_ioapi(video_id)
         if err:
             print(f"  → ioapi failed: {err}")
