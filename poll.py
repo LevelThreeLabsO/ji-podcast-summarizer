@@ -917,13 +917,7 @@ def summarize_tweet(tweet):
     if tweet["author_handle"]:
         author = f"{author} (@{tweet['author_handle']})"
     prompt = TWEET_PROMPT.format(author=author, text=tweet["text"])
-    response = _gemini_generate_with_retry(prompt, max_tokens=512)
-    raw = (response.text or "").strip()
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw).strip()
-        return json.loads(raw)
+    return _gemini_json(prompt, max_tokens=512, want=dict)
 
 
 def build_tweet_reply(tweet, verdict):
@@ -1060,18 +1054,80 @@ def _gemini_generate_with_retry(prompt, max_tokens=8192):
         if last_err else "Gemini call failed for unknown reason")
 
 
+_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$")
+# Control characters are illegal inside a JSON string. Models occasionally emit
+# a raw newline or tab inside a quoted value, which is exactly the kind of
+# "Expecting value: line N column M" error that used to discard a link.
+_BAD_CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+
+def _salvage_json(raw):
+    """Best-effort parse of a model's JSON reply. Returns the parsed value, or
+    None if nothing usable could be recovered."""
+    if not raw:
+        return None
+    for candidate in _json_candidates(raw):
+        try:
+            return json.loads(candidate)
+        except (json.JSONDecodeError, ValueError):
+            continue
+    return None
+
+
+def _json_candidates(raw):
+    """Progressively more aggressive repairs of a model JSON reply."""
+    raw = raw.strip()
+    yield raw
+    stripped = _FENCE_RE.sub("", raw).strip()
+    yield stripped
+    # Slice to the outermost bracket pair — drops any prose the model wrapped
+    # around the JSON ("Here are the moments: [...]  Hope this helps!").
+    for open_c, close_c in (("[", "]"), ("{", "}")):
+        i, j = stripped.find(open_c), stripped.rfind(close_c)
+        if i != -1 and j > i:
+            body = stripped[i:j + 1]
+            yield body
+            yield _BAD_CTRL_RE.sub(" ", body)
+            # Trailing comma before a closing bracket.
+            yield re.sub(r",(\s*[}\]])", r"\1",
+                         _BAD_CTRL_RE.sub(" ", body))
+
+
+def _gemini_json(prompt, max_tokens, want, attempts=3):
+    """Call Gemini and parse its JSON reply, re-sampling on unparseable output.
+
+    Gemini is NON-DETERMINISTIC, so a malformed reply is a transient hiccup,
+    not a permanent property of the input — re-asking almost always works. The
+    old code parsed once and let json.JSONDecodeError escape to main(), whose
+    `except Exception` marks the message processed and drops it silently.
+    That is how https://www.youtube.com/watch?v=GHF-Q6lvp0o was lost on
+    2026-09-27 ("JSONDecodeError: Expecting value: line 10 column 17") after
+    its transcript had already been fetched successfully: 1,462 segments
+    retrieved, then thrown away over a formatting slip.
+
+    `want` is the expected top-level type (list or dict). Raises TransientError
+    when every attempt fails, so the caller's backoff retries later instead of
+    discarding the link.
+    """
+    last_raw = ""
+    for attempt in range(1, attempts + 1):
+        response = _gemini_generate_with_retry(prompt, max_tokens=max_tokens)
+        last_raw = (response.text or "").strip()
+        parsed = _salvage_json(last_raw)
+        if isinstance(parsed, want):
+            if attempt > 1:
+                print(f"  → model JSON recovered on attempt {attempt}")
+            return parsed
+        print(f"  ! model returned unparseable JSON (attempt {attempt}/{attempts})",
+              file=sys.stderr)
+    raise TransientError(
+        f"Gemini returned unparseable JSON {attempts}x "
+        f"(last reply started: {last_raw[:120]!r})")
+
+
 def summarize(transcript_text, video_title):
     prompt = SUMMARY_PROMPT.format(title=video_title, transcript=transcript_text)
-    response = _gemini_generate_with_retry(prompt, max_tokens=4096)
-    raw = (response.text or "").strip()
-    try:
-        moments = json.loads(raw)
-    except json.JSONDecodeError:
-        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw).strip()
-        moments = json.loads(raw)
-    if not isinstance(moments, list):
-        return []
-    return moments
+    return _gemini_json(prompt, max_tokens=4096, want=list)
 
 
 # ── Article fetch + summary ────────────────────────────────────────────────────
@@ -1174,16 +1230,7 @@ def fetch_article(url):
 
 def summarize_article(text, article_title):
     prompt = ARTICLE_PROMPT.format(title=article_title, text=text[:60000])
-    response = _gemini_generate_with_retry(prompt, max_tokens=4096)
-    raw = (response.text or "").strip()
-    try:
-        moments = json.loads(raw)
-    except json.JSONDecodeError:
-        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw).strip()
-        moments = json.loads(raw)
-    if not isinstance(moments, list):
-        return []
-    return moments
+    return _gemini_json(prompt, max_tokens=4096, want=list)
 
 
 def build_article_reply(title, url, moments):
@@ -1307,6 +1354,38 @@ def _is_transient(err_str):
 # Set when the ioapi quota alert has already been raised in this process, so a
 # run that processes several links warns at most once.
 _quota_warned = False
+
+
+# A link is retried on this schedule (_BACKOFF) and abandoned after this many
+# attempts — 120+300+900+2700+3600 ≈ 2h30m of trying before giving up. Long
+# enough to ride out a sleeping Mac, a tunnel rotation, or a Gemini outage;
+# short enough that one poisoned link cannot pin the polling window forever.
+_MAX_RETRIES = 6
+
+
+def _warn_gave_up(slack, url, ts, err):
+    """Report a link the bot is abandoning after exhausting its retries.
+
+    Same restraint as _warn_quota_exhausted: always loud in the run log, and
+    posts to Slack only when YT_QUOTA_ALERT_CHANNEL is explicitly configured.
+    Without it this stays log-only, honouring the standing rule that these
+    automations never invent channel chatter.
+    """
+    print(f"  !! GAVE UP on {url} (msg {ts}) after {_MAX_RETRIES} attempts: {err}",
+          file=sys.stderr)
+    channel = os.environ.get("YT_QUOTA_ALERT_CHANNEL") or ""
+    if not channel or slack is None:
+        return
+    try:
+        slack._call("chat.postMessage", json_body={
+            "channel": channel,
+            "text": (f":warning: gave up summarizing {url} after {_MAX_RETRIES} "
+                     f"attempts over ~2.5h. Last error: {err}"),
+            "unfurl_links": False,
+            "unfurl_media": False,
+        })
+    except Exception as e:
+        print(f"  ! give-up alert could not be posted: {type(e).__name__}", file=sys.stderr)
 
 
 def _warn_quota_exhausted(slack):
@@ -1647,6 +1726,19 @@ def main():
                 advanceable_ts = max(advanceable_ts, ts_f)
         except TransientError as e:
             n = retry_count.get(ts, 0)
+            if n + 1 >= _MAX_RETRIES:
+                # Give up, but LOUDLY and only after ~2.5 hours of trying.
+                # Without this cap retry_count grew forever at the 3600s
+                # ceiling, and because a failed message freezes
+                # advanceable_ts, one permanently-broken link would pin the
+                # polling window behind it and stall every link posted after.
+                print(f"  ✗ giving up after {n + 1} attempts: {e}",
+                      file=sys.stderr)
+                _warn_gave_up(slack, url, ts, e)
+                processed.add(ts)
+                retry_after.pop(ts, None)
+                retry_count.pop(ts, None)
+                continue
             delay = _BACKOFF[min(n, len(_BACKOFF) - 1)]
             retry_count[ts] = n + 1
             retry_after[ts] = now_ts + delay
