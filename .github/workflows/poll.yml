@@ -75,6 +75,13 @@ jobs:
           # exhausted or the service fails.
           CLIPMAKER_URL: ${{ secrets.CLIPMAKER_URL }}
           CLIPMAKER_AUTH_TOKEN: ${{ secrets.CLIPMAKER_AUTH_TOKEN }}
+          # Optional. Unset -> every failure alert stays log-only, which is
+          # the current behaviour. poll.py has read this since the quota
+          # work but it was never passed to the job, so _warn_quota_exhausted
+          # and _warn_gave_up were dead code — the direct reason the dead
+          # ioapi quota went unnoticed from 2026-08-18 to 2026-09-23 while
+          # every run still reported conclusion=success.
+          YT_QUOTA_ALERT_CHANNEL: ${{ secrets.YT_QUOTA_ALERT_CHANNEL }}
       - name: Commit updated state
         # if: always() — even if poll.py raised at the end, save_state() is
         # atomic and may have committed useful work (messages processed
