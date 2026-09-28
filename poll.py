@@ -1180,11 +1180,32 @@ _V_RULE = ("  - Must be your faithful transcription of what is actually said on 
            "do not paraphrase, condense, or clean up. If you cannot hear it cleanly, "
            "use an empty string rather than guessing.")
 
+# Working from audio rather than a transcript, the model reaches harder for
+# beat-relevance. Tested on eJP with an off-beat video (Rahm Emanuel, US
+# politics): the video tier reframed a blind-trust proposal for ELECTED
+# OFFICIALS as "donor-advised funds in the nonprofit sector", and Trump's UAE
+# crypto investment as a foreign donation threatening communal integrity —
+# precisely what eJP's FILTER 1 exists to reject. The transcript path on the
+# same video was also off-beat but did NOT invent a connection; it simply
+# reported what was said. That difference is what this paragraph targets.
+_V_GATE = """
+BEFORE ANYTHING ELSE — the beat gate:
+  - Judge relevance on what the speaker ACTUALLY said, not on what the topic
+    could be connected to. Do not build a bridge from an off-beat statement to
+    this publication's beat.
+  - A claim is on-beat only if it would still be on-beat written out in plain
+    words with no reframing. If you have to reinterpret what was said to make
+    it fit, it does not fit.
+  - Returning [] for a conversation outside this beat is a CORRECT answer and
+    costs nothing. A reframed off-beat item is a false positive that a reporter
+    has to catch, and is far more expensive than a missing one.
+"""
+
 assert SUMMARY_PROMPT.count(_T_BLOCK) == 1, "SUMMARY_PROMPT transcript block moved"
 assert SUMMARY_PROMPT.count(_T_RULE) == 1, "SUMMARY_PROMPT quote rule moved"
 VIDEO_SUMMARY_PROMPT = (SUMMARY_PROMPT
                         .replace(_T_BLOCK, _V_BLOCK, 1)
-                        .replace(_T_RULE, _V_RULE, 1))
+                        .replace(_T_RULE, _V_RULE, 1)) + _V_GATE
 
 
 def yt_moments_via_gemini_video(url, video_title):
@@ -1560,6 +1581,13 @@ def process_url(url, dry_run=False, slack=None, thread_ts=None):
             #
             # Returns moments directly — there is no transcript to summarize.
             try:
+                if os.environ.get("SKIP_GEMINI_VIDEO"):
+                    # Debug escape hatch so the Mac/transcript path can be
+                    # exercised on its own and compared against this tier. Added
+                    # because eJP's video-tier output on an off-beat video
+                    # contained fabricated philanthropy angles, and there was no
+                    # way to tell whether the transcript path does the same.
+                    raise TransientError("SKIP_GEMINI_VIDEO set — skipping tier 2")
                 title = yt_title(video_id) or "video"
                 moments = yt_moments_via_gemini_video(url, title)
                 if moments:
