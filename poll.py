@@ -1716,7 +1716,14 @@ def main():
     args = parser.parse_args()
 
     if args.url:
-        process_url(args.url, dry_run=True)
+        # Print the reply. Without this a dry run reported only "→ 5 notable
+        # moments" and there was no way to check what it would actually post —
+        # which is the entire reason to have a dry run.
+        reply, is_summary = process_url(args.url, dry_run=True)
+        print("\n" + "=" * 70)
+        print(f"DRY RUN — would post (is_summary={is_summary}):")
+        print("=" * 70)
+        print(reply if reply else "(nothing — link skipped)")
         return
 
     slack = Slack()
