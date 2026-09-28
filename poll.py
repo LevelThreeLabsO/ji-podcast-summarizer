@@ -951,10 +951,19 @@ def format_transcript_for_llm(segments):
 
 # ── Gemini summarizer ──────────────────────────────────────────────────────────
 
-def _gemini_generate_with_retry(prompt, max_tokens=8192):
+def _gemini_generate_with_retry(prompt, max_tokens=8192, video_url=None):
     """Call Gemini with retries + model fallback. Gemini's 'flash-latest' can
     hit 503 UNAVAILABLE (high demand). We retry with backoff, and if the fast
-    model keeps failing, fall back to a lite variant."""
+    model keeps failing, fall back to a lite variant.
+
+    When `video_url` is a YouTube URL, the video is passed to Gemini as a
+    file_data part and GOOGLE fetches it — this runner's IP never touches
+    YouTube. That is the entire point: yt-dlp is bot-walled from GitHub's
+    datacenter IPs (probe run 36031406872, 2026-09-24: 8/8 real news videos
+    refused with "Sign in to confirm you're not a bot", across 5 runner IPs and
+    5 configurations including a working PO-token provider and curl_cffi
+    impersonation). Gemini is not, because the fetch happens on Google's side.
+    """
     from google import genai
     from google.genai import types as gtypes
     from google.genai import errors as gerrors
@@ -991,10 +1000,21 @@ def _gemini_generate_with_retry(prompt, max_tokens=8192):
         "gemini-flash-latest",
         "gemini-flash-lite-latest",
     ]
-    config = gtypes.GenerateContentConfig(
-        response_mime_type="application/json",
-        max_output_tokens=max_tokens,
-    )
+    if video_url:
+        # response_mime_type alongside a video part is untested, so it is left
+        # off here — _salvage_json already strips the ```json fences the probe
+        # run returned, which is exactly what this would have prevented.
+        config = gtypes.GenerateContentConfig(max_output_tokens=max_tokens)
+        contents = gtypes.Content(parts=[
+            gtypes.Part(file_data=gtypes.FileData(file_uri=video_url)),
+            gtypes.Part(text=prompt),
+        ])
+    else:
+        config = gtypes.GenerateContentConfig(
+            response_mime_type="application/json",
+            max_output_tokens=max_tokens,
+        )
+        contents = prompt
 
     # httpx network errors bubble up from google-genai's HTTP client (e.g.
     # RemoteProtocolError when Google's server drops the connection mid-response).
@@ -1007,10 +1027,23 @@ def _gemini_generate_with_retry(prompt, max_tokens=8192):
         for attempt in range(3):
             try:
                 return client.models.generate_content(
-                    model=model, contents=prompt, config=config,
+                    model=model, contents=contents, config=config,
                 )
             except gerrors.ClientError as e:
                 msg = str(e)
+                if video_url:
+                    # On the video tier ANY 4xx means "try the next model".
+                    # Only gemini-3.6-flash is proven to ingest a YouTube URL
+                    # (probe 36418484658, 2026-09-28: 4 successes incl. a
+                    # 62-minute video in 76s). The other five were never
+                    # observed succeeding OR refusing — both attempts drew a
+                    # 503 overload — so a model that turns out not to support
+                    # file_data would answer 400, and the shared `raise` below
+                    # would kill the whole tier on the first such model instead
+                    # of falling through to one that works.
+                    exhausted.append(model)
+                    last_err = e
+                    break
                 if "RESOURCE_EXHAUSTED" in msg or "429" in msg:
                     # Quota, not a bad request. The free tier is metered per
                     # project PER MODEL, so the next model in the list has its
@@ -1093,7 +1126,7 @@ def _json_candidates(raw):
                          _BAD_CTRL_RE.sub(" ", body))
 
 
-def _gemini_json(prompt, max_tokens, want, attempts=3):
+def _gemini_json(prompt, max_tokens, want, attempts=3, video_url=None):
     """Call Gemini and parse its JSON reply, re-sampling on unparseable output.
 
     Gemini is NON-DETERMINISTIC, so a malformed reply is a transient hiccup,
@@ -1111,7 +1144,8 @@ def _gemini_json(prompt, max_tokens, want, attempts=3):
     """
     last_raw = ""
     for attempt in range(1, attempts + 1):
-        response = _gemini_generate_with_retry(prompt, max_tokens=max_tokens)
+        response = _gemini_generate_with_retry(prompt, max_tokens=max_tokens,
+                                               video_url=video_url)
         last_raw = (response.text or "").strip()
         parsed = _salvage_json(last_raw)
         if isinstance(parsed, want):
@@ -1128,6 +1162,54 @@ def _gemini_json(prompt, max_tokens, want, attempts=3):
 def summarize(transcript_text, video_title):
     prompt = SUMMARY_PROMPT.format(title=video_title, transcript=transcript_text)
     return _gemini_json(prompt, max_tokens=4096, want=list)
+
+
+# The video-tier prompt is DERIVED from SUMMARY_PROMPT rather than copied, so
+# the JI beat rubric and the output schema live in exactly one place and cannot
+# drift apart. The asserts make a future edit to SUMMARY_PROMPT fail loudly at
+# import instead of silently leaving this prompt telling the model to quote
+# from a transcript it was never given.
+_T_BLOCK = "TRANSCRIPT (with [MM:SS] timestamps):\n{transcript}"
+_V_BLOCK = (
+    "You are given the VIDEO ITSELF — watch and listen to it directly.\n"
+    "There is no transcript. Work out start_min/end_min from the video's own\n"
+    "elapsed time."
+)
+_T_RULE = "  - Must appear VERBATIM in the transcript — do not paraphrase, condense, or clean up."
+_V_RULE = ("  - Must be your faithful transcription of what is actually said on the audio — "
+           "do not paraphrase, condense, or clean up. If you cannot hear it cleanly, "
+           "use an empty string rather than guessing.")
+
+assert SUMMARY_PROMPT.count(_T_BLOCK) == 1, "SUMMARY_PROMPT transcript block moved"
+assert SUMMARY_PROMPT.count(_T_RULE) == 1, "SUMMARY_PROMPT quote rule moved"
+VIDEO_SUMMARY_PROMPT = (SUMMARY_PROMPT
+                        .replace(_T_BLOCK, _V_BLOCK, 1)
+                        .replace(_T_RULE, _V_RULE, 1))
+
+
+def yt_moments_via_gemini_video(url, video_title):
+    """Summarize a YouTube video by handing Gemini the URL and letting GOOGLE
+    fetch it. Returns the same `moments` list summarize() returns.
+
+    This exists because yt-dlp cannot reach YouTube from a GitHub Actions
+    runner — 8/8 real news videos refused with "Sign in to confirm you're not a
+    bot" across 5 runner IPs and 5 configurations (probe 36031406872). Google
+    fetching the video on its own side sidesteps that completely, and costs no
+    youtube-transcript.io quota and no Mac.
+
+    Proven from a real Actions runner on 2026-09-28 (probe 36418484658,
+    gemini-3.6-flash): 4 successes including bTJggsMK6uQ — the exact video
+    yt-dlp was blocked on — in 27.7s, and a 62-minute video in 76.4s. The two
+    failures in that run were HTTP 503 model-overload, not refusals.
+
+    Raises TransientError on quota/overload so the caller retries on a later
+    tick. It must NEVER return an empty list to mean failure: the YouTube
+    branch treats a falsy result as "nothing news-making" and marks the link
+    permanently done, which is the silent-drop that hid the dead ioapi quota
+    for five weeks.
+    """
+    prompt = VIDEO_SUMMARY_PROMPT.format(title=video_title)
+    return _gemini_json(prompt, max_tokens=4096, want=list, video_url=url)
 
 
 # ── Article fetch + summary ────────────────────────────────────────────────────
@@ -1251,10 +1333,18 @@ def build_article_reply(title, url, moments):
 
 # ── Reply formatting ───────────────────────────────────────────────────────────
 
-def build_reply(title, moments):
+def build_reply(title, moments, from_audio=False):
     if not moments:
         return f"Scanned *{_esc(title)}* — no clearly news-making moments jumped out."
     lines = [f"*Notable Moments from “{_esc(title)}”*", ""]
+    if from_audio:
+        # Say so. On every other tier the quote is lifted from a caption file,
+        # so it can be checked against a source. On this tier there is no
+        # transcript at all — the quote is the model's own transcription of the
+        # audio. A reporter putting a name next to a quote needs to know which
+        # of those two they are holding.
+        lines.insert(1, "_Transcribed from audio by AI — verify quotes before"
+                        " publishing._")
     for i, m in enumerate(moments, 1):
         s = int(m.get("start_min", 0))
         e = int(m.get("end_min", s))
@@ -1450,16 +1540,38 @@ def process_url(url, dry_run=False, slack=None, thread_ts=None):
         # no Mac needed). Fallback: ClipMaker on Mac (residential IP, no cap).
         segments, cm_title, err = yt_transcript_via_ioapi(video_id)
         if err:
-            print(f"  → ioapi failed: {err} — falling back to Mac")
+            print(f"  → ioapi failed: {err}")
             if err is YT_QUOTA_EXHAUSTED or "monthly quota exhausted" in err:
                 # Surface it once per run. Silence here is exactly what let the
                 # quota sit dead from 2026-08-18 to 2026-09-23 while every link
                 # limped through the Mac — which then became a single point of
                 # failure the moment its tunnel died.
                 _warn_quota_exhausted(slack)
+
+            # TIER 2 — hand the URL to Gemini and let Google fetch the video.
+            # No quota, no Mac, no tunnel. Tried BEFORE ClipMaker because it is
+            # the only remaining path with no single point of failure: the Mac
+            # being awake, the tunnel being alive, and the CLIPMAKER_URL secret
+            # being current are three separate things that must all hold, and
+            # on 2026-09-27 the third one failed for 3h51m.
+            #
+            # Returns moments directly — there is no transcript to summarize.
+            try:
+                title = yt_title(video_id) or "video"
+                moments = yt_moments_via_gemini_video(url, title)
+                if moments:
+                    print(f"  → {len(moments)} notable moments (Gemini video)")
+                    return build_reply(title, moments, from_audio=True), True
+                print("  → Gemini video: nothing news-making")
+                return None, False
+            except TransientError as e:
+                # Quota or 503 across all six models. Fall through to the Mac
+                # rather than giving up — ClipMaker has no daily cap.
+                print(f"  → Gemini video tier unavailable: {e} — falling back to Mac")
+
             segments, cm_title, err = yt_transcript_via_clipmaker(url)
             if err and _is_transient(err):
-                raise TransientError(f"YT transcript unreachable (both paths): {err}")
+                raise TransientError(f"YT transcript unreachable (all paths): {err}")
         if err or not segments:
             # Both paths gave a permanent-ish failure — video may have no
             # captions, be region-locked, or removed. Skip silently.
