@@ -1747,10 +1747,22 @@ def main():
     args = parser.parse_args()
 
     if args.url:
+        # A Slack client is passed even in dry-run so the failure-alert path is
+        # exercised for real. process_url never posts a summary itself — main()
+        # does — so this stays a dry run for the summary while still proving
+        # that _warn_quota_exhausted can actually reach its destination.
+        # Without this the alert wiring could only ever be tested in production.
+        probe_slack = None
+        try:
+            probe_slack = Slack()
+            if not (probe_slack.token and probe_slack.channel):
+                probe_slack = None
+        except Exception:
+            probe_slack = None
         # Print the reply. Without this a dry run reported only "→ 5 notable
         # moments" and there was no way to check what it would actually post —
         # which is the entire reason to have a dry run.
-        reply, is_summary = process_url(args.url, dry_run=True)
+        reply, is_summary = process_url(args.url, dry_run=True, slack=probe_slack)
         print("\n" + "=" * 70)
         print(f"DRY RUN — would post (is_summary={is_summary}):")
         print("=" * 70)
