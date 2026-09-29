@@ -29,12 +29,31 @@ jobs:
               print("  BODY (first 1500 chars):")
               print("  " + (r.text[:1500] if r.text else "(empty)"))
 
-          # 1. the exact call the bot makes
-          r = requests.post("https://www.youtube-transcript.io/api/transcripts",
-                            headers={"Authorization": f"Basic {tok}",
-                                     "Content-Type": "application/json"},
-                            json={"ids": ["dQw4w9WgXcQ"]}, timeout=60)
-          show("POST /api/transcripts (what the bot does)", r)
+          # A cached video may be served without touching the quota, so test a
+          # spread: the control, the video the bot actually 402'd on, and a
+          # freshly-published one nobody has requested before.
+          import subprocess, re
+          fresh = []
+          try:
+              import urllib.request
+              rss = urllib.request.urlopen(
+                  "https://www.youtube.com/feeds/videos.xml?channel_id=UCupvZG-5ko_eiXAupbDfxWw",
+                  timeout=20).read().decode()
+              fresh = re.findall(r"<yt:videoId>([\w-]{11})</yt:videoId>", rss)[:2]
+              print("fresh CNN video ids from RSS:", fresh)
+          except Exception as e:
+              print("RSS lookup failed:", type(e).__name__, e)
+
+          cases = [("CONTROL cached rickroll", "dQw4w9WgXcQ"),
+                   ("THE VIDEO THE BOT 402'd ON", "8Mri-tL4Bys")]
+          cases += [(f"FRESH-{i}", v) for i, v in enumerate(fresh, 1)]
+
+          for label, vid in cases:
+              r = requests.post("https://www.youtube-transcript.io/api/transcripts",
+                                headers={"Authorization": f"Basic {tok}",
+                                         "Content-Type": "application/json"},
+                                json={"ids": [vid]}, timeout=60)
+              show(f"{label} ({vid})", r)
 
           # 2. look for any account / usage endpoint
           for path in ("/api/me", "/api/account", "/api/usage", "/api/quota",
