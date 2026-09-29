@@ -1,0 +1,48 @@
+name: probe ioapi quota
+on:
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install requests
+      - name: Dump the raw response from youtube-transcript.io
+        env:
+          YT_TRANSCRIPT_IO_TOKEN: ${{ secrets.YT_TRANSCRIPT_IO_TOKEN }}
+        run: |
+          python3 -u - <<'PY'
+          import os, json, requests
+          tok = os.environ["YT_TRANSCRIPT_IO_TOKEN"]
+          print("token present:", bool(tok), "len:", len(tok))
+
+          def show(label, r):
+              print("=" * 60)
+              print(f"{label}: HTTP {r.status_code}")
+              interesting = {k: v for k, v in r.headers.items()
+                             if any(s in k.lower() for s in
+                                    ("rate", "limit", "quota", "credit", "remain",
+                                     "reset", "usage", "retry"))}
+              print("  quota-ish headers:", json.dumps(interesting, indent=2) if interesting else "(none)")
+              print("  BODY (first 1500 chars):")
+              print("  " + (r.text[:1500] if r.text else "(empty)"))
+
+          # 1. the exact call the bot makes
+          r = requests.post("https://www.youtube-transcript.io/api/transcripts",
+                            headers={"Authorization": f"Basic {tok}",
+                                     "Content-Type": "application/json"},
+                            json={"ids": ["dQw4w9WgXcQ"]}, timeout=60)
+          show("POST /api/transcripts (what the bot does)", r)
+
+          # 2. look for any account / usage endpoint
+          for path in ("/api/me", "/api/account", "/api/usage", "/api/quota",
+                       "/api/user", "/api/subscription"):
+              try:
+                  rr = requests.get("https://www.youtube-transcript.io" + path,
+                                    headers={"Authorization": f"Basic {tok}"}, timeout=20)
+                  print(f"--- GET {path}: HTTP {rr.status_code}  {rr.text[:300]!r}")
+              except Exception as e:
+                  print(f"--- GET {path}: {type(e).__name__}")
+          PY
