@@ -1524,9 +1524,11 @@ def _warn_quota_exhausted(slack):
         slack._call("chat.postMessage", json_body={
             "channel": channel,
             "text": (":warning: youtube-transcript.io monthly allowance is used up "
-                     "(free tier: 25/month, resets on the 1st). YouTube links are "
-                     "falling back to ClipMaker on the Mac until then, so the Mac "
-                     "needs to stay awake with a live tunnel."),
+                     "(free tier: 25/month, resets on the 1st). YouTube links now "
+                     "fall through to the Gemini video tier, which needs no Mac and "
+                     "no tunnel — nothing for you to do. The only difference is that "
+                     "those summaries are transcribed from audio rather than a "
+                     "caption file, and say so, so verify quotes before publishing."),
             "unfurl_links": False,
             "unfurl_media": False,
         })
