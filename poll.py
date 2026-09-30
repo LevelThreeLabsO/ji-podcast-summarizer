@@ -1849,6 +1849,11 @@ def main():
     parser.add_argument("--dry-run", action="store_true",
                         help="Print replies instead of posting to Slack.")
     parser.add_argument("--url", help="Process one URL and exit (implies --dry-run).")
+    parser.add_argument(
+        "--post-thread-ts", default=None,
+        help="With --url: actually POST the summary into this Slack thread "
+             "instead of only printing it. Recovers a link the poller missed, "
+             "without touching watcher_state.json.")
     parser.add_argument("--window-hours", type=int, default=None,
                         help="Override baseline window on first run (default: 1 hour).")
     args = parser.parse_args()
@@ -1870,6 +1875,30 @@ def main():
         # moments" and there was no way to check what it would actually post —
         # which is the entire reason to have a dry run.
         reply, is_summary = process_url(args.url, dry_run=True, slack=probe_slack)
+
+        # --post-thread-ts turns this into the recovery tool the poller needs.
+        #
+        # Hand-editing watcher_state.json to re-queue a link DOES NOT WORK: the
+        # poller loads state at checkout, holds it in memory for the whole run,
+        # and writes the entire file back at the end. A run starts every ~30s,
+        # so any external edit is overwritten by a run that checked out before
+        # it landed. Two re-queues of Max's Caroline Glick video on 2026-09-30
+        # were silently reverted this way (commits 54dbde4 and f180e13, undone
+        # by 0a8ece4 and b1594e0) and the link was never re-processed at all.
+        #
+        # Posting straight into the thread sidesteps state entirely: no race,
+        # nothing to revert, and it does exactly what the poller would have.
+        if args.post_thread_ts:
+            if not reply:
+                print("nothing to post — this URL produced no summary")
+                return
+            if probe_slack is None:
+                sys.exit("--post-thread-ts needs SLACK_BOT_TOKEN and SLACK_CHANNEL_ID")
+            probe_slack.post_reply(args.post_thread_ts, reply, broadcast=is_summary)
+            print(f"POSTED into thread {args.post_thread_ts} "
+                  f"(broadcast={is_summary})")
+            return
+
         print("\n" + "=" * 70)
         print(f"DRY RUN — would post (is_summary={is_summary}):")
         print("=" * 70)
