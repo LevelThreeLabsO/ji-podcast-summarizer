@@ -1256,9 +1256,11 @@ BEFORE ANYTHING ELSE — the beat gate:
   - A claim is on-beat only if it would still be on-beat written out in plain
     words with no reframing. If you have to reinterpret what was said to make
     it fit, it does not fit.
-  - Returning [] for a conversation outside this beat is a CORRECT answer and
-    costs nothing. A reframed off-beat item is a false positive that a reporter
-    has to catch, and is far more expensive than a missing one.
+  - [] is the right answer when the conversation genuinely is not about this
+    beat. It is the WRONG answer for a conversation that plainly is — a long
+    interview with a named figure on this publication's core subject will have
+    notable moments in it, and returning nothing there is a miss, not caution.
+    Judge the conversation, not the individual sentence.
 """
 
 assert SUMMARY_PROMPT.count(_T_BLOCK) == 1, "SUMMARY_PROMPT transcript block moved"
@@ -1296,7 +1298,23 @@ def yt_moments_via_gemini_video(url, video_title):
     # content. Soahcftkj9o (81 min) returned unparseable JSON on one run and
     # parsed fine on the next, which is what a budget right at the edge looks
     # like.
-    return _gemini_json(prompt, max_tokens=8192, want=list, video_url=url)
+    moments = _gemini_json(prompt, max_tokens=8192, want=list, video_url=url)
+    if not moments:
+        # An empty list closes the link PERMANENTLY — process_url reads it as
+        # "nothing news-making", marks the message processed and never looks at
+        # it again. That is far too final to rest on one sample from a
+        # non-deterministic model.
+        #
+        # Max's 81-minute Caroline Glick interview was closed exactly this way
+        # on 2026-09-30 at 03:28: no error, no retry, nothing posted — while a
+        # manual run of the same video and code returned five on-beat moments.
+        # One re-sample would have caught it.
+        print("  → Gemini video returned nothing — re-sampling once before "
+              "accepting that")
+        moments = _gemini_json(prompt, max_tokens=8192, want=list, video_url=url)
+        if moments:
+            print(f"  → second sample found {len(moments)} — first was a bad draw")
+    return moments
 
 
 # ── Article fetch + summary ────────────────────────────────────────────────────
