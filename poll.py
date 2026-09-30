@@ -1094,17 +1094,60 @@ _FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$")
 _BAD_CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 
 
-def _salvage_json(raw):
+def _salvage_json(raw, want=None):
     """Best-effort parse of a model's JSON reply. Returns the parsed value, or
-    None if nothing usable could be recovered."""
+    None if nothing usable could be recovered.
+
+    `want` is the expected top-level type. It matters: the repairs below are
+    tried cheapest-first, and the {...} slice fires before truncation recovery.
+    On a reply truncated mid-array that slice yields the FIRST OBJECT ALONE,
+    which parses fine as a dict and used to win — so a 5-moment reply cut short
+    came back as one moment-shaped dict, failed the caller's isinstance check,
+    and the whole reply was discarded with four recoverable moments in it.
+    Skipping wrong-typed candidates lets the later, better repair win.
+    """
     if not raw:
         return None
     for candidate in _json_candidates(raw):
         try:
-            return json.loads(candidate)
+            parsed = json.loads(candidate)
         except (json.JSONDecodeError, ValueError):
             continue
+        if want is not None and not isinstance(parsed, want):
+            continue
+        return parsed
     return None
+
+
+
+def _complete_objects(text):
+    """Yield the complete top-level {...} blocks in `text`, ignoring any
+    unterminated one at the end. Brace-counting is string-aware so a brace
+    inside a quoted value does not throw the depth off."""
+    out, depth, start, in_str, esc = [], 0, None, False, False
+    for pos, ch in enumerate(text):
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            if depth == 0:
+                start = pos
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0 and start is not None:
+                out.append(text[start:pos + 1])
+                start = None
+            elif depth < 0:
+                break
+    return out
 
 
 def _json_candidates(raw):
@@ -1124,6 +1167,14 @@ def _json_candidates(raw):
             # Trailing comma before a closing bracket.
             yield re.sub(r",(\s*[}\]])", r"\1",
                          _BAD_CTRL_RE.sub(" ", body))
+
+    # TRUNCATION. If the model ran out of output budget mid-array there is no
+    # closing bracket at all, so every repair above fails and the whole reply
+    # is thrown away — including the four complete moments sitting in front of
+    # the cut. Recover them. Four good moments beat a dropped link.
+    i = stripped.find("[")
+    if i != -1:
+        yield "[" + ",".join(_complete_objects(stripped[i + 1:])) + "]"
 
 
 def _gemini_json(prompt, max_tokens, want, attempts=3, video_url=None):
@@ -1147,7 +1198,7 @@ def _gemini_json(prompt, max_tokens, want, attempts=3, video_url=None):
         response = _gemini_generate_with_retry(prompt, max_tokens=max_tokens,
                                                video_url=video_url)
         last_raw = (response.text or "").strip()
-        parsed = _salvage_json(last_raw)
+        parsed = _salvage_json(last_raw, want=want)
         if isinstance(parsed, want):
             if attempt > 1:
                 print(f"  → model JSON recovered on attempt {attempt}")
@@ -1239,7 +1290,13 @@ def yt_moments_via_gemini_video(url, video_title):
     for five weeks.
     """
     prompt = VIDEO_SUMMARY_PROMPT.format(title=video_title)
-    return _gemini_json(prompt, max_tokens=4096, want=list, video_url=url)
+    # 8192, not 4096. Gemini 3 spends output budget on internal reasoning
+    # before it writes anything, and a long video makes it think longer — so
+    # the reply can be cut off mid-array with the budget nominally unspent on
+    # content. Soahcftkj9o (81 min) returned unparseable JSON on one run and
+    # parsed fine on the next, which is what a budget right at the edge looks
+    # like.
+    return _gemini_json(prompt, max_tokens=8192, want=list, video_url=url)
 
 
 # ── Article fetch + summary ────────────────────────────────────────────────────
@@ -1568,6 +1625,9 @@ def process_url(url, dry_run=False, slack=None, thread_ts=None):
     if yt_match:
         video_id = yt_match.group(1)
         print(f"  → YouTube video {video_id}")
+        # Set if the Gemini tier fails in a way that is worth retrying, so a
+        # later permanent failure on the Mac cannot silently discard the link.
+        gemini_transient = None
         # Tier 1: youtube-transcript.io — the only tier that yields a real
         # caption file, so the only one whose pull-quotes can be checked
         # against a source. Free tier is 25 per MONTH, resetting on the 1st,
@@ -1610,13 +1670,31 @@ def process_url(url, dry_run=False, slack=None, thread_ts=None):
                 # Quota or 503 across all six models. Fall through to the Mac
                 # rather than giving up — ClipMaker has no daily cap.
                 print(f"  → Gemini video tier unavailable: {e} — falling back to Mac")
+                gemini_transient = e
 
             segments, cm_title, err = yt_transcript_via_clipmaker(url)
             if err and _is_transient(err):
                 raise TransientError(f"YT transcript unreachable (all paths): {err}")
+            if err and gemini_transient is not None:
+                # Gemini failed TRANSIENTLY and only then did the Mac fail. The
+                # Mac's failure may genuinely be permanent for this video (no
+                # captions, Whisper timeout on a long one), but Gemini's was
+                # not — and Gemini can summarize a video with no captions at
+                # all. Dropping the link here discards a tier that is merely
+                # having a bad minute.
+                #
+                # This is what lost Max's Caroline Glick video on 2026-09-28:
+                # the Gemini reply came back unparseable, the Mac could not
+                # finish an 81-minute video either, and the link was marked
+                # processed with no reply and no retry. Retrying costs one tick
+                # and usually works — that same video summarized cleanly on the
+                # very next attempt.
+                raise TransientError(
+                    f"YT transcript failed on every tier; Gemini's failure was "
+                    f"transient so this is worth retrying: {gemini_transient}")
         if err or not segments:
-            # Both paths gave a permanent-ish failure — video may have no
-            # captions, be region-locked, or removed. Skip silently.
+            # Every tier gave a permanent failure — video may have no captions,
+            # be region-locked, or removed. Skip silently.
             print(f"  → no transcript (permanent): {err or 'no segments'}")
             return None, False
         title = cm_title if cm_title and cm_title != "video" else yt_title(video_id)
