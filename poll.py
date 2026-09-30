@@ -1152,8 +1152,17 @@ def _gemini_json(prompt, max_tokens, want, attempts=3, video_url=None):
             if attempt > 1:
                 print(f"  → model JSON recovered on attempt {attempt}")
             return parsed
-        print(f"  ! model returned unparseable JSON (attempt {attempt}/{attempts})",
-              file=sys.stderr)
+        # Log what actually came back. Without this the failure reads as
+        # "unparseable JSON" with no way to tell truncation from a preamble
+        # from a refusal — which is exactly where Soahcftkj9o stalled on
+        # 2026-09-28. Head AND tail: truncation is only visible at the end.
+        head = last_raw[:300].replace("\n", "\\n")
+        tail = last_raw[-200:].replace("\n", "\\n") if len(last_raw) > 300 else ""
+        print(f"  ! model returned unparseable JSON (attempt {attempt}/{attempts}) "
+              f"len={len(last_raw)}", file=sys.stderr)
+        print(f"    head: {head!r}", file=sys.stderr)
+        if tail:
+            print(f"    tail: {tail!r}", file=sys.stderr)
     raise TransientError(
         f"Gemini returned unparseable JSON {attempts}x "
         f"(last reply started: {last_raw[:120]!r})")
