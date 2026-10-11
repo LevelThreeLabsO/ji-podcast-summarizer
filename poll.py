@@ -1219,8 +1219,48 @@ def _gemini_json(prompt, max_tokens, want, attempts=3, video_url=None):
         f"(last reply started: {last_raw[:120]!r})")
 
 
+def _is_allcaps(text, sample=20000, threshold=0.9):
+    """True when a transcript is essentially all upper-case.
+
+    Broadcast closed captions (CEA-608 and the tracks derived from it) are
+    traditionally ALL CAPS. A Meet the Press interview on 2026-10-11 came
+    through at 100% uppercase across 28,721 letters, and because the prompt
+    requires quotes to appear VERBATIM in the transcript, every pull-quote
+    posted to Slack shouted:
+
+        "IDEALLY YOU PUT ONE OGRE ON A SPIKE."
+
+    Checked on a sample rather than the whole transcript — the case of a
+    caption track does not change halfway through, and these run to 60k+ chars.
+    """
+    letters = [c for c in text[:sample] if c.isalpha()]
+    if len(letters) < 200:
+        return False
+    return sum(1 for c in letters if c.isupper()) / len(letters) >= threshold
+
+
+# Appended ONLY for an all-caps source. Fixing the case in code would be worse
+# than useless here: a blanket .lower()/.title() turns AIPAC into Aipac, I into
+# i, and 9/11 into something else again. The model already knows which words
+# are proper nouns and acronyms, so it does the restoring — and is told
+# explicitly that this is the one thing it may change, so "verbatim" earlier in
+# the prompt is not quietly contradicted.
+_ALLCAPS_NOTE = """
+
+IMPORTANT — THE TRANSCRIPT BELOW IS ALL UPPER-CASE.
+That is an artifact of broadcast closed-captioning, not how anyone spoke. When
+you quote it, restore natural sentence capitalisation: ordinary words lower
+case, and proper nouns, acronyms and "I" capitalised as they normally would be
+(AIPAC, Gaza, Netanyahu, Democrats, 9/11). Change NOTHING else — not a word,
+not its order, not its punctuation. Case is the only thing you may alter.
+"""
+
+
 def summarize(transcript_text, video_title):
     prompt = SUMMARY_PROMPT.format(title=video_title, transcript=transcript_text)
+    if _is_allcaps(transcript_text):
+        print("  → source captions are ALL CAPS — asking for restored case")
+        prompt += _ALLCAPS_NOTE
     return _gemini_json(prompt, max_tokens=4096, want=list)
 
 
