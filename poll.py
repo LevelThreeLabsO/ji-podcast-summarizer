@@ -1661,6 +1661,32 @@ def _warn_quota_exhausted(slack):
         print(f"  ! quota alert could not be posted: {type(e).__name__}", file=sys.stderr)
 
 
+def _deliver(reply, is_summary, dry_run, slack, thread_ts):
+    """Post a finished reply, or print it on a dry run. Returns what
+    process_url returns.
+
+    This exists because main() calls process_url() and DISCARDS its return
+    value — posting is a side effect here, not something the caller does with
+    the result. So any branch that builds a reply and returns early skips
+    posting and silently bins a perfectly good summary.
+
+    That is exactly what the Gemini video tier did from 2026-09-28 to
+    2026-10-15: runs logged "5 notable moments (Gemini video)", exited success,
+    and posted nothing. It hid for weeks because links WITH captions take tier
+    1, which falls through to the shared tail correctly.
+
+    Every branch that produces a reply must return through here.
+    """
+    if dry_run or not slack:
+        print("--- REPLY ---")
+        print(reply)
+        print("-------------")
+    else:
+        slack.post_reply(thread_ts, reply, broadcast=is_summary)
+        print(f"  → posted reply in thread {thread_ts} (broadcast={is_summary})")
+    return reply, is_summary
+
+
 def process_url(url, dry_run=False, slack=None, thread_ts=None):
     """Fetch transcript/tweet/article, summarize, post to Slack.
 
@@ -1721,7 +1747,9 @@ def process_url(url, dry_run=False, slack=None, thread_ts=None):
                 moments = yt_moments_via_gemini_video(url, title)
                 if moments:
                     print(f"  → {len(moments)} notable moments (Gemini video)")
-                    return build_reply(title, moments, from_audio=True), True
+                    # Through _deliver, NOT a bare return — see its docstring.
+                    return _deliver(build_reply(title, moments, from_audio=True),
+                                    True, dry_run, slack, thread_ts)
                 print("  → Gemini video: nothing news-making")
                 return None, False
             except TransientError as e:
@@ -1872,14 +1900,7 @@ def process_url(url, dry_run=False, slack=None, thread_ts=None):
     else:
         return None, False
 
-    if dry_run or not slack:
-        print("--- REPLY ---")
-        print(reply)
-        print("-------------")
-    else:
-        slack.post_reply(thread_ts, reply, broadcast=is_summary)
-        print(f"  → posted reply in thread {thread_ts} (broadcast={is_summary})")
-    return reply, is_summary
+    return _deliver(reply, is_summary, dry_run, slack, thread_ts)
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
