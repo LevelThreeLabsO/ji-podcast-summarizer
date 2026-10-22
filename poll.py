@@ -825,6 +825,33 @@ def podcast_transcript_via_clipmaker(url):
 
 # ── Twitter/X ──────────────────────────────────────────────────────────────────
 
+def _tweet_video_info(url):
+    """(has_video, duration_seconds) for a tweet, via yt-dlp. (False, 0) if none.
+
+    Costs one metadata probe (~2-4s) per tweet, which buys the difference
+    between summarizing a 40-minute podcast episode and dismissing it on its
+    promo text.
+    """
+    import subprocess
+    try:
+        proc = subprocess.run(
+            ["yt-dlp", "--skip-download", "--print", "%(duration)s", "--", url],
+            capture_output=True, text=True, timeout=60,
+        )
+    except Exception:
+        return False, 0
+    if proc.returncode != 0:
+        return False, 0
+    raw = (proc.stdout or "").strip().splitlines()
+    if not raw:
+        return False, 0
+    try:
+        return True, int(float(raw[-1].strip()))
+    except (ValueError, TypeError):
+        # A video with unknown duration is still a video.
+        return True, 0
+
+
 def fetch_tweet(url):
     """Fetch a tweet's text + author via Twitter's public oembed API.
 
@@ -868,7 +895,17 @@ def fetch_tweet(url):
 
     # Detect embedded video via the pic.twitter.com marker in the raw HTML.
     # Cheap heuristic — oembed doesn't tell us the media type directly.
-    has_video = "video.twimg.com" in html_body or "video/" in html_body.lower()
+    # Ask yt-dlp whether there is a video, instead of guessing from the oembed
+    # HTML. The old heuristic was:
+    #     has_video = "video.twimg.com" in html_body or "video/" in html_body
+    # and X stopped putting either marker in that HTML, so it returned False for
+    # EVERY tweet. On 2026-10-22 a Katie Miller Podcast tweet carrying a
+    # 40-minute Bill Ackman episode was scored False and dismissed on its promo
+    # blurb; a Daniel Lubetzky tweet with a 22-second clip likewise.
+    #
+    # yt-dlp is the right authority here because it is also what would do the
+    # transcribing — if it cannot see a video, there is nothing to transcribe.
+    has_video, video_duration = _tweet_video_info(url)
 
     author_name = data.get("author_name", "").strip()
     author_url = data.get("author_url", "") or ""
@@ -880,6 +917,7 @@ def fetch_tweet(url):
         "author_name": author_name,
         "author_handle": author_handle,
         "has_video": has_video,
+        "video_duration": video_duration,
     }
 
 
@@ -1801,8 +1839,20 @@ def process_url(url, dry_run=False, slack=None, thread_ts=None):
             return None, False
         # Video-only tweets: transcribe the video (yt-dlp handles X.com URLs)
         # and summarize like a podcast/YouTube video into 5 Notable Moments.
-        if tweet["has_video"] and len(tweet["text"]) < 40:
-            print("  → video-only tweet — transcribing")
+        # Transcribe when there is a video worth transcribing. The old test was
+        # `has_video and len(text) < 40`, which meant a video tweet with a
+        # proper caption could never qualify — and a podcast episode always has
+        # a proper caption. A 40-minute Bill Ackman interview was judged on the
+        # words "This week on the Katie Miller Podcast:" and dropped.
+        #
+        # Long video: transcribe it, whatever the caption says.
+        # Short video with almost no caption: transcribe it, as before — the
+        #   caption cannot carry the meaning on its own.
+        # Otherwise: judge the tweet text, which is the right call for a clip
+        #   posted to make a point the caption already states.
+        _vid_dur = tweet.get("video_duration") or 0
+        if tweet["has_video"] and (_vid_dur >= 120 or len(tweet["text"]) < 40):
+            print(f"  → tweet video ({_vid_dur}s) — transcribing")
             segments, _t, err = podcast_transcript_direct(url)
             if err:
                 if _is_transient(err):
