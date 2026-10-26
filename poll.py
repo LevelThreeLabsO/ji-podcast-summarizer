@@ -243,15 +243,38 @@ def _pick_original_track(tracks):
         return None, (f"only machine-translated caption tracks available "
                       f"({names}…) — refusing to quote a translation")
 
-    # Among genuine tracks, prefer one explicitly flagged original, then
-    # English, then whatever is left (covers Hebrew/Arabic-original videos).
+    # Ranking among genuine (non-translated) tracks.
+    #
+    # The old version returned 0 for ANY name containing "orig", which looked
+    # right until a video used YouTube's MULTI-LANGUAGE AUDIO feature. Such a
+    # video carries several tracks all flagged original — one per audio dub:
+    #
+    #     ar-orig   Arabic (Original)
+    #     en-orig   English (Original)
+    #     iw-orig   Hebrew (Original)
+    #
+    # All three scored 0, sorted() is stable, and Arabic came first, so on
+    # 2026-10-26 a New York panel with Dan Shapiro and Bret Stephens — declared
+    # language en-US — was summarized with every pull-quote in Arabic.
+    #
+    # English-flagged-original now outranks a bare original. This does NOT
+    # reintroduce "prefer English": machine translations were already removed
+    # above, so an English track surviving to here means English audio genuinely
+    # exists. A Hebrew-only speech has no English original — its English would
+    # be "English from Hebrew" and already filtered — so Hebrew still wins
+    # there, which is the behaviour the 2026-09-08 fix exists to protect.
     def rank(t):
         n = name_of(t).lower()
-        if "orig" in n:
+        is_english = (n.startswith("english") or n.startswith("en-")
+                      or n in ("en", "en_us", "en-us", "en-gb"))
+        is_original = "orig" in n
+        if is_english and is_original:
             return 0
-        if n.startswith("english") or n in ("en", "en-us", "en-gb"):
+        if is_english:
             return 1
-        return 2
+        if is_original:
+            return 2
+        return 3
 
     return sorted(originals, key=rank)[0], None
 
