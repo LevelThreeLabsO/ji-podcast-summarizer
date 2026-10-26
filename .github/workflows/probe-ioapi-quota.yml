@@ -1,6 +1,11 @@
 name: probe ioapi quota
 on:
   workflow_dispatch:
+    inputs:
+      video_id:
+        description: Video id to probe
+        required: false
+        default: AhEZeU8ujhc
 jobs:
   probe:
     runs-on: ubuntu-latest
@@ -9,59 +14,34 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: "3.11" }
       - run: pip install requests
-      - name: Dump the raw response from youtube-transcript.io
+      - name: Probe ioapi language options
         env:
           YT_TRANSCRIPT_IO_TOKEN: ${{ secrets.YT_TRANSCRIPT_IO_TOKEN }}
+          VID: ${{ inputs.video_id }}
         run: |
           python3 -u - <<'PY'
           import os, json, requests
-          tok = os.environ["YT_TRANSCRIPT_IO_TOKEN"]
-          print("token present:", bool(tok), "len:", len(tok))
-
-          def show(label, r):
-              print("=" * 60)
-              print(f"{label}: HTTP {r.status_code}")
-              interesting = {k: v for k, v in r.headers.items()
-                             if any(s in k.lower() for s in
-                                    ("rate", "limit", "quota", "credit", "remain",
-                                     "reset", "usage", "retry"))}
-              print("  quota-ish headers:", json.dumps(interesting, indent=2) if interesting else "(none)")
-              print("  BODY (first 1500 chars):")
-              print("  " + (r.text[:1500] if r.text else "(empty)"))
-
-          # A cached video may be served without touching the quota, so test a
-          # spread: the control, the video the bot actually 402'd on, and a
-          # freshly-published one nobody has requested before.
-          import subprocess, re
-          fresh = []
-          try:
-              import urllib.request
-              rss = urllib.request.urlopen(
-                  "https://www.youtube.com/feeds/videos.xml?channel_id=UCupvZG-5ko_eiXAupbDfxWw",
-                  timeout=20).read().decode()
-              fresh = re.findall(r"<yt:videoId>([\w-]{11})</yt:videoId>", rss)[:2]
-              print("fresh CNN video ids from RSS:", fresh)
-          except Exception as e:
-              print("RSS lookup failed:", type(e).__name__, e)
-
-          cases = [("CONTROL cached rickroll", "dQw4w9WgXcQ"),
-                   ("THE VIDEO THE BOT 402'd ON", "8Mri-tL4Bys")]
-          cases += [(f"FRESH-{i}", v) for i, v in enumerate(fresh, 1)]
-
-          for label, vid in cases:
-              r = requests.post("https://www.youtube-transcript.io/api/transcripts",
-                                headers={"Authorization": f"Basic {tok}",
-                                         "Content-Type": "application/json"},
-                                json={"ids": [vid]}, timeout=60)
-              show(f"{label} ({vid})", r)
-
-          # 2. look for any account / usage endpoint
-          for path in ("/api/me", "/api/account", "/api/usage", "/api/quota",
-                       "/api/user", "/api/subscription"):
+          tok=os.environ["YT_TRANSCRIPT_IO_TOKEN"]; vid=os.environ.get("VID") or "AhEZeU8ujhc"
+          H={"Authorization":f"Basic {tok}","Content-Type":"application/json"}
+          def show(label, body):
               try:
-                  rr = requests.get("https://www.youtube-transcript.io" + path,
-                                    headers={"Authorization": f"Basic {tok}"}, timeout=20)
-                  print(f"--- GET {path}: HTTP {rr.status_code}  {rr.text[:300]!r}")
+                  r=requests.post("https://www.youtube-transcript.io/api/transcripts",
+                                  headers=H, json=body, timeout=90)
               except Exception as e:
-                  print(f"--- GET {path}: {type(e).__name__}")
+                  print(f"  {label}: EXC {e}"); return
+              print(f"  {label}: HTTP {r.status_code}")
+              if not r.ok:
+                  print("    body:", (r.text or "")[:200]); return
+              try: d=r.json()
+              except Exception: print("    non-JSON"); return
+              item = d[0] if isinstance(d,list) and d else {}
+              tr = item.get("tracks") or []
+              print(f"    tracks: {[{k:v for k,v in t.items() if k!='transcript'} for t in tr]}")
+              for t in tr:
+                  seg=(t.get('transcript') or [])[:1]
+                  print(f"    first seg of {t.get('language')}: {str(seg)[:120]}")
+          show("plain {ids}", {"ids":[vid]})
+          show("with languages=[en]", {"ids":[vid], "languages":["en"]})
+          show("with lang=en", {"ids":[vid], "lang":"en"})
+          show("with language=en", {"ids":[vid], "language":"en"})
           PY
