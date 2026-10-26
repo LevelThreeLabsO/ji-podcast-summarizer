@@ -276,7 +276,14 @@ def _pick_original_track(tracks):
             return 2
         return 3
 
-    return sorted(originals, key=rank)[0], None
+    chosen = sorted(originals, key=rank)[0]
+    # Log what was on offer and what won. Picking the wrong caption track is
+    # invisible in the output — a summary built from an Arabic track looks
+    # perfectly well-formed — so without this line the only way to notice is a
+    # human reading the Slack post, and the only way to debug is guesswork.
+    print(f"  → caption tracks: {[name_of(t) for t in tracks][:12]}")
+    print(f"  → chose track: {name_of(chosen)!r}")
+    return chosen, None
 
 
 def yt_transcript_via_ioapi(video_id):
