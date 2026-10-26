@@ -277,6 +277,31 @@ def _pick_original_track(tracks):
         return 3
 
     chosen = sorted(originals, key=rank)[0]
+
+    # If nothing English survived, do NOT quote this track. youtube-transcript.io
+    # serves whatever YouTube calls the default caption track, and on a video
+    # using multi-language audio that can be a language the speakers never used.
+    #
+    # AhEZeU8ujhc on 2026-10-26 is the case in point: a New York panel with Dan
+    # Shapiro and Bret Stephens, yt-dlp reports language en-US, and ioapi offers
+    # exactly one track — ['ar'] — whose first segment is "إنها القاعدة الأولى".
+    # Asking for English does not help; languages=[en], lang=en and language=en
+    # all return the same Arabic track. So the summary went out with every
+    # pull-quote in Arabic, twice.
+    #
+    # Falling through costs one tier. Gemini watches the actual video, so it
+    # hears what was really said instead of trusting a caption track of unknown
+    # provenance — and that is the right answer whether the audio turns out to
+    # be English or not.
+    #
+    # This is NOT the "prefer English" rule the 2026-09-08 fix warns against.
+    # That warning is about quoting an English MACHINE TRANSLATION over a
+    # genuine original. Nothing is translated here; the link simply moves to a
+    # tier that reads the source directly.
+    if rank(chosen) >= 2:
+        names = ", ".join(name_of(t) for t in tracks[:6])
+        return None, (f"no English caption track (offered: {names}) — "
+                      f"using video analysis instead")
     # Log what was on offer and what won. Picking the wrong caption track is
     # invisible in the output — a summary built from an Arabic track looks
     # perfectly well-formed — so without this line the only way to notice is a
