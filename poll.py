@@ -1109,10 +1109,25 @@ def _gemini_generate_with_retry(prompt, max_tokens=8192, video_url=None):
         )
         contents = prompt
 
-    # httpx network errors bubble up from google-genai's HTTP client (e.g.
+    # Network errors bubble up from google-genai's HTTP client (e.g.
     # RemoteProtocolError when Google's server drops the connection mid-response).
     # These are transient and worth retrying — same treatment as ServerError.
-    import httpx
+    #
+    # WHICH client that is changed under us: google-genai < 3.0 depended on
+    # httpx; 3.0.0 (released 2026-11-06 02:29 UTC) switched to httpx2 and made
+    # httpx an optional extra. A bare `import httpx` then raised
+    # ModuleNotFoundError, the catch-all in main() treated that as a permanent
+    # per-link failure, and every link posted to all three bots after that
+    # release was silently dropped while every workflow run still reported
+    # success. Never name one of them unconditionally again — collect whichever
+    # are actually installed.
+    _transport_bases = []
+    for _mod_name in ("httpx2", "httpx"):
+        try:
+            _transport_bases.append(__import__(_mod_name).TransportError)
+        except Exception:
+            pass
+    _TRANSPORT_ERRORS = tuple(_transport_bases)
 
     last_err = None
     exhausted = []
@@ -1152,7 +1167,7 @@ def _gemini_generate_with_retry(prompt, max_tokens=8192, video_url=None):
                 # long, wrong permission — is genuinely permanent. Retrying or
                 # switching models sends the same bad request.
                 raise
-            except (gerrors.ServerError, httpx.TransportError) as e:
+            except (gerrors.ServerError, *_TRANSPORT_ERRORS) as e:
                 # httpx.TransportError is the BASE class for every network-level
                 # failure: ConnectError, ConnectTimeout, ReadError, ReadTimeout,
                 # WriteError, PoolTimeout, RemoteProtocolError, ProxyError.
@@ -2213,15 +2228,38 @@ def main():
             # comes back, the summary posts as if nothing happened.
             any_failed = True
         except Exception as e:
-            print(f"  ! unexpected failure: {type(e).__name__}: {e}", file=sys.stderr)
-            # Unknown deterministic error (Gemini 4xx, malformed JSON,
-            # AttributeError on unexpected LLM output, etc.). Retrying will
-            # produce the same failure and freeze the watermark. Mark as
-            # processed so we move on. The thread has no reply, matching the
-            # "silent skip on permanent failure" contract.
-            processed.add(ts)
-            if not any_failed:
-                advanceable_ts = max(advanceable_ts, ts_f)
+            # Unknown failure: a Gemini 4xx, malformed LLM output, or a broken
+            # environment. This used to mark the link processed and move on in
+            # SILENCE, on the theory that an unknown error is deterministic and
+            # retrying would only freeze the watermark.
+            #
+            # That theory cost five days of output. When google-genai 3.0
+            # swapped httpx for httpx2 on 2026-11-06, every link raised
+            # ModuleNotFoundError here and was discarded — no reply, no alert,
+            # and ~2,600 green workflow runs a day saying everything was fine.
+            # An environment break is not deterministic; it is transient on the
+            # scale of "until someone deploys a fix".
+            #
+            # So unknown errors now get the same bounded retry as declared
+            # transient ones: ~2.5 hours, then a loud give-up DM. The watermark
+            # still cannot freeze, because _MAX_RETRIES ends every link one way
+            # or the other — but nothing disappears quietly any more.
+            n = retry_count.get(ts, 0)
+            if n + 1 >= _MAX_RETRIES:
+                print(f"  ✗ giving up after {n + 1} attempts: "
+                      f"{type(e).__name__}: {e}", file=sys.stderr)
+                _warn_gave_up(slack, url, ts, e)
+                processed.add(ts)
+                retry_after.pop(ts, None)
+                retry_count.pop(ts, None)
+                continue
+            delay = _BACKOFF[min(n, len(_BACKOFF) - 1)]
+            retry_count[ts] = n + 1
+            retry_after[ts] = now_ts + delay
+            print(f"  ! unexpected failure — retry in {delay}s "
+                  f"(attempt {n + 1}): {type(e).__name__}: {e}",
+                  file=sys.stderr)
+            any_failed = True
 
     if not args.dry_run:
         state["last_ts"] = f"{advanceable_ts:.6f}"
