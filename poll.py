@@ -1869,7 +1869,18 @@ def process_url(url, dry_run=False, slack=None, thread_ts=None):
             segments, cm_title, err = yt_transcript_via_clipmaker(url)
             if err and _is_transient(err):
                 raise TransientError(f"YT transcript unreachable (all paths): {err}")
-            if err and gemini_transient is not None:
+            if (err or not segments) and gemini_transient is not None:
+                # NOTE the `or not segments`. ClipMaker answers 200 with an
+                # empty segment list when yt-dlp finds no caption file at all —
+                # which is what a LIVE stream looks like, since a broadcast in
+                # progress has no finished captions. That returns err=None, so
+                # a guard that tested `err` alone fell straight through to the
+                # permanent branch and printed "no transcript (permanent): no
+                # segments". On 2026-11-17 that silently discarded a live
+                # Atlantic Summit stream while the Gemini quota happened to be
+                # exhausted. An empty result and an error mean the same thing
+                # here: this tier produced nothing.
+                #
                 # Gemini failed TRANSIENTLY and only then did the Mac fail. The
                 # Mac's failure may genuinely be permanent for this video (no
                 # captions, Whisper timeout on a long one), but Gemini's was
