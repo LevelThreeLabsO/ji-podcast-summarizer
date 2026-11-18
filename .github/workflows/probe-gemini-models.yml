@@ -1,0 +1,48 @@
+name: probe gemini model list
+# Read-only. Asks the API which models the bot's own key can actually call,
+# because a model name that Google retires reads as a 404 at call time and
+# there is no other way to see the live list from here. Prints names only —
+# never the key.
+on:
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install -r requirements.txt
+      - name: List callable models
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          python3 -u - <<'PY'
+          import os
+          from google import genai
+          client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+
+          want = [
+              "gemini-3.6-flash",
+              "gemini-3-flash-preview",
+              "gemini-3.1-flash-lite",
+              "gemini-3.5-flash-lite",
+              "gemini-flash-latest",
+              "gemini-flash-lite-latest",
+          ]
+
+          live = []
+          for m in client.models.list():
+              actions = getattr(m, "supported_actions", None) or []
+              if "generateContent" in actions or not actions:
+                  live.append(m.name.replace("models/", ""))
+
+          print("=== models the current list asks for ===")
+          for w in want:
+              print(f"  {'OK  ' if w in live else 'GONE'}  {w}")
+
+          print()
+          print("=== every callable flash model ===")
+          for n in sorted(n for n in live if "flash" in n):
+              print(f"  {n}")
+          PY
