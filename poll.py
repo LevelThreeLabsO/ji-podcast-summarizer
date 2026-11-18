@@ -1229,13 +1229,35 @@ def _gemini_generate_with_retry(prompt, max_tokens=8192, video_url=None):
                 # long, wrong permission — is genuinely permanent. Retrying or
                 # switching models sends the same bad request.
                 raise
-            except (gerrors.ServerError, *_TRANSPORT_ERRORS) as e:
+            except gerrors.ServerError as e:
+                # 5xx means THIS MODEL is overloaded — a per-model condition,
+                # like quota, not a network fault. So treat it like quota and
+                # move on. The list exists precisely so we never have to beg
+                # one model.
+                #
+                # It used to share the retry loop below, which is written for
+                # network flakiness. Measured in run 44399100369: three
+                # attempts against an overloaded gemini-3.7-flash cost 3m30s,
+                # every one of them running out the 75s request timeout, while
+                # gemini-3.1-flash-lite — the NEXT entry in the list — answered
+                # the same 50k-char prompt in 3 seconds. The second link in
+                # that tick spent its whole budget on the overloaded model and
+                # never got to the one that works.
+                last_err = e
+                print(f"  → gemini: {model} overloaded ({type(e).__name__}) "
+                      f"— next model", file=sys.stderr)
+                break
+            except _TRANSPORT_ERRORS as e:
                 # httpx.TransportError is the BASE class for every network-level
                 # failure: ConnectError, ConnectTimeout, ReadError, ReadTimeout,
                 # WriteError, PoolTimeout, RemoteProtocolError, ProxyError.
                 # Naming them individually left gaps — httpx.ReadError ("connection
                 # reset by peer") escaped an earlier four-name list and crashed the
                 # run. All of these are worth retrying; none is a bad request.
+                #
+                # These DO retry in place, unlike a 5xx above: a reset
+                # connection says nothing about the model, so switching models
+                # would not help and would burn a second daily bucket.
                 last_err = e
                 print(f"  → gemini: {model} {type(e).__name__} "
                       f"(attempt {attempt + 1}/3)", file=sys.stderr)
