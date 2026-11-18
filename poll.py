@@ -1073,8 +1073,8 @@ def _gemini_generate_with_retry(prompt, max_tokens=8192, video_url=None):
     # third build all failed at once.
     #
     # Fix: give each bot its OWN primary model so they draw on separate buckets.
-    # JI owns gemini-3.6-flash; Circuit owns gemini-3-flash-preview. The shared
-    # alias is kept only as a last-resort fallback.
+    # JI leads with gemini-3.6-flash, Circuit with gemini-3.5-flash, eJP with
+    # gemini-3.7-flash, so no two bots drain the same bucket first.
     #
     # PINNED ON PURPOSE. "gemini-flash-latest" silently followed Google to
     # gemini-3.8-flash, whose free limit is far tighter — the quota shrank with
@@ -1087,11 +1087,11 @@ def _gemini_generate_with_retry(prompt, max_tokens=8192, video_url=None):
     # politeness.
     models = [
         "gemini-3.6-flash",
-        "gemini-3-flash-preview",
+        "gemini-3.5-flash",
+        "gemini-3.7-flash",
         "gemini-3.1-flash-lite",
         "gemini-3.5-flash-lite",
-        "gemini-flash-latest",
-        "gemini-flash-lite-latest",
+        "gemini-2.5-flash",
     ]
     if video_url:
         # response_mime_type alongside a video part is untested, so it is left
@@ -1131,6 +1131,7 @@ def _gemini_generate_with_retry(prompt, max_tokens=8192, video_url=None):
 
     last_err = None
     exhausted = []
+    retired = []
     for model in models:
         for attempt in range(3):
             try:
@@ -1163,6 +1164,28 @@ def _gemini_generate_with_retry(prompt, max_tokens=8192, video_url=None):
                     exhausted.append(model)
                     last_err = e
                     break
+                if "NOT_FOUND" in msg or "404" in msg:
+                    # A 404 here names the MODEL, not the request. Google
+                    # retires model names on its own schedule and the only
+                    # symptom is this error at call time — nothing changes in
+                    # git, so it looks like the bot broke by itself.
+                    #
+                    # It must be handled exactly like a quota 429: this model
+                    # is unusable, the NEXT one is fine. Falling through to the
+                    # `raise` below instead killed the entire chain on the
+                    # first dead name. On 2026-11-18 gemini-3-flash-preview was
+                    # retired while it sat at position 2 in JI's list and
+                    # position 1 in Circuit's; gemini-3.6-flash ahead of it had
+                    # just hit its daily quota, so one dead name took out four
+                    # perfectly good models behind it and the bot stopped
+                    # answering links in the channel.
+                    #
+                    # Tracked separately from `exhausted` because the remedy is
+                    # different: a quota refills by itself, a retired name has
+                    # to be edited out of the list. The give-up alert says so.
+                    retired.append(model)
+                    last_err = e
+                    break
                 # Any other 4xx — safety filter, malformed prompt, context too
                 # long, wrong permission — is genuinely permanent. Retrying or
                 # switching models sends the same bad request.
@@ -1186,6 +1209,16 @@ def _gemini_generate_with_retry(prompt, max_tokens=8192, video_url=None):
     # retries on a later tick rather than marking the URL permanently done —
     # an exhausted daily quota refills, and a silently dropped link never comes
     # back. This is the same class of bug as the 405 misclassification.
+    if retired:
+        # Deliberately loud and specific: this one needs a human to edit the
+        # list, and a message that only said "quota" would send that human
+        # looking for a quota that was never the problem.
+        detail = (f" Quota was also exhausted on: {', '.join(exhausted)}."
+                  if exhausted else "")
+        raise TransientError(
+            f"Gemini model(s) NO LONGER EXIST and must be removed from the "
+            f"list in poll.py: {', '.join(retired)}.{detail} Nothing in the "
+            f"fallback chain answered.")
     if exhausted:
         raise TransientError(
             f"Gemini daily quota exhausted on {len(exhausted)} model(s): "
