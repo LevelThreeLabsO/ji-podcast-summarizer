@@ -1044,6 +1044,27 @@ def format_transcript_for_llm(segments):
 
 # ── Gemini summarizer ──────────────────────────────────────────────────────────
 
+# One slow model must not be able to eat the whole step.
+#
+# 2026-11-18, run 44396116813: the poll step has an 8-minute timeout. A run
+# reached "1114 segments, ~50387 chars" and then printed NOTHING for eight
+# minutes before the runner killed it — six models x three attempts, every
+# request unbounded, and not one log line saying which model was being tried.
+#
+# The kill is worse than it looks. Because the process dies mid-run, the retry
+# counter for that link is never written to state, so the link comes back on
+# the next tick with its attempt count unchanged: it retries forever, never
+# reaches _MAX_RETRIES, and therefore never fires the give-up alert. A link
+# that silently loops is exactly the failure mode these bots are supposed to
+# have stopped having.
+#
+# So: bound a single request, bound the whole chain for one link, and print a
+# line per model so the next hang names itself. The budget is sized against
+# the 8-minute step with room for two links in one tick (2 x 200s = 400s).
+_GEMINI_CALL_TIMEOUT_S = 75   # any single request
+_GEMINI_BUDGET_S = 200        # the whole fallback chain, for one link
+
+
 def _gemini_generate_with_retry(prompt, max_tokens=8192, video_url=None):
     """Call Gemini with retries + model fallback. Gemini's 'flash-latest' can
     hit 503 UNAVAILABLE (high demand). We retry with backoff, and if the fast
@@ -1064,7 +1085,13 @@ def _gemini_generate_with_retry(prompt, max_tokens=8192, video_url=None):
     key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
     if not key:
         raise RuntimeError("GEMINI_API_KEY is not set")
-    client = genai.Client(api_key=key)
+    # timeout is MILLISECONDS here, and it applies to every request this
+    # client makes — which is the point: the chain below cannot bound itself
+    # if an individual call never returns.
+    client = genai.Client(
+        api_key=key,
+        http_options=gtypes.HttpOptions(timeout=_GEMINI_CALL_TIMEOUT_S * 1000),
+    )
 
     # Gemini's free tier is quota'd PER PROJECT **PER MODEL** (quotaId
     # GenerateRequestsPerDayPerProjectPerModel-FreeTier, 20/day as of
@@ -1132,7 +1159,13 @@ def _gemini_generate_with_retry(prompt, max_tokens=8192, video_url=None):
     last_err = None
     exhausted = []
     retired = []
+    deadline = time.monotonic() + _GEMINI_BUDGET_S
     for model in models:
+        if time.monotonic() >= deadline:
+            print(f"  → gemini: {_GEMINI_BUDGET_S}s budget spent — not trying "
+                  f"{model} or anything after it", file=sys.stderr)
+            break
+        print(f"  → gemini: trying {model}", file=sys.stderr)
         for attempt in range(3):
             try:
                 return client.models.generate_content(
@@ -1150,6 +1183,8 @@ def _gemini_generate_with_retry(prompt, max_tokens=8192, video_url=None):
                     # file_data would answer 400, and the shared `raise` below
                     # would kill the whole tier on the first such model instead
                     # of falling through to one that works.
+                    print(f"  → gemini: {model} refused the video tier",
+                          file=sys.stderr)
                     exhausted.append(model)
                     last_err = e
                     break
@@ -1161,6 +1196,8 @@ def _gemini_generate_with_retry(prompt, max_tokens=8192, video_url=None):
                     # made the fallback chain dead code the moment a daily
                     # quota ran out (2026-09-22: every bot failed at once with
                     # five usable models sitting unused behind the first).
+                    print(f"  → gemini: {model} is out of daily quota",
+                          file=sys.stderr)
                     exhausted.append(model)
                     last_err = e
                     break
@@ -1183,6 +1220,8 @@ def _gemini_generate_with_retry(prompt, max_tokens=8192, video_url=None):
                     # Tracked separately from `exhausted` because the remedy is
                     # different: a quota refills by itself, a retired name has
                     # to be edited out of the list. The give-up alert says so.
+                    print(f"  → gemini: {model} NO LONGER EXISTS",
+                          file=sys.stderr)
                     retired.append(model)
                     last_err = e
                     break
@@ -1198,9 +1237,14 @@ def _gemini_generate_with_retry(prompt, max_tokens=8192, video_url=None):
                 # reset by peer") escaped an earlier four-name list and crashed the
                 # run. All of these are worth retrying; none is a bad request.
                 last_err = e
-                # Sleep 4s, 12s before the next attempt within the same model.
-                if attempt < 2:
-                    time.sleep(4 * (attempt * 2 + 1))
+                print(f"  → gemini: {model} {type(e).__name__} "
+                      f"(attempt {attempt + 1}/3)", file=sys.stderr)
+                # Sleep 4s, 12s before the next attempt within the same model —
+                # but never sleep past the budget, which would spend the time
+                # left on waiting rather than on the next model.
+                nap = 4 * (attempt * 2 + 1)
+                if attempt < 2 and time.monotonic() + nap < deadline:
+                    time.sleep(nap)
                     continue
                 # Otherwise fall through to the next model.
                 break
@@ -1223,6 +1267,11 @@ def _gemini_generate_with_retry(prompt, max_tokens=8192, video_url=None):
         raise TransientError(
             f"Gemini daily quota exhausted on {len(exhausted)} model(s): "
             f"{', '.join(exhausted)} — will retry when quota resets")
+    if time.monotonic() >= deadline:
+        raise TransientError(
+            f"Gemini spent its {_GEMINI_BUDGET_S}s budget without an answer"
+            + (f" (last: {type(last_err).__name__}: {last_err})"
+               if last_err else ""))
     raise TransientError(
         f"Gemini transient after retries: {type(last_err).__name__}: {last_err}"
         if last_err else "Gemini call failed for unknown reason")
