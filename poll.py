@@ -1835,6 +1835,49 @@ def _warn_gave_up(slack, url, ts, err):
         print(f"  ! give-up alert could not be posted: {type(e).__name__}", file=sys.stderr)
 
 
+_STALE_AFTER_S = 900  # 15 min: ~30x the normal 25-30s chain interval
+
+
+def _warn_was_down(slack, gap_s):
+    """Say out loud that the bot had stopped, the moment it comes back.
+
+    The self-chain IS the cadence here: each run dispatches the next, roughly
+    every 25-30s. Lose one dispatch and the bot simply stops. Every run that
+    already happened is green, the workflow still shows "active", and nothing
+    anywhere says the thing is dead.
+
+    The chain step's comment claims "schedule cron will recover". Measured on
+    2026-11-25, that is not true in any useful sense: GitHub throttles a */5
+    cron on a busy repo down to roughly ONE FIRING EVERY EIGHT HOURS (observed
+    firings 18:15Z, 02:37Z, 11:44Z). So the chain died at 15:43Z and the bot
+    was still dead four hours later, discovered only because a human noticed
+    missing bullets.
+
+    This cannot restart a dead bot — nothing running inside the dead bot can.
+    What it does is make the outage self-reported the moment anything revives
+    it, so the user hears it from the bot rather than from absent output.
+    """
+    mins = int(gap_s // 60)
+    print(f"  !! bot had stopped: no run for ~{mins} min", file=sys.stderr)
+    channel = os.environ.get("YT_QUOTA_ALERT_CHANNEL") or ""
+    if not channel or slack is None:
+        return
+    try:
+        slack._call("chat.postMessage", json_body={
+            "channel": channel,
+            "text": (f":warning: podcast summarizer had stopped for ~{mins} "
+                     f"minutes and has just started again. Links posted during "
+                     f"that window are being picked up now. If you see this "
+                     f"often, the self-chain is dropping dispatches and the bot "
+                     f"needs an external trigger."),
+            "unfurl_links": False,
+            "unfurl_media": False,
+        })
+    except Exception as e:
+        print(f"  ! downtime alert could not be posted: {type(e).__name__}",
+              file=sys.stderr)
+
+
 def _warn_quota_exhausted(slack):
     """Make an exhausted monthly allowance visible instead of silent.
 
@@ -2208,6 +2251,21 @@ def main():
 
     state = load_state()
     now = time.time()
+
+    # Heartbeat. last_run_at is written every run; a gap much larger than the
+    # chain interval means the bot was dead, not idle, and that is worth
+    # saying. Checked before any work so the alert goes out even if this run
+    # then fails for its own reasons.
+    _prev_run = state.get("last_run_at")
+    if _prev_run and not args.dry_run:
+        try:
+            _gap = now - float(_prev_run)
+        except (TypeError, ValueError):
+            _gap = 0
+        if _gap > _STALE_AFTER_S:
+            _warn_was_down(slack, _gap)
+    state["last_run_at"] = now
+
     baseline_window = (args.window_hours or 1) * 3600
     since = state.get("last_ts") or f"{now - baseline_window:.6f}"
     first_run = not state.get("last_ts")
